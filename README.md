@@ -56,7 +56,7 @@ The Kube-OVN community is waiting for your participation!
 
 The Switch, Router and Firewall showed in the diagram below are all distributed on all Nodes. There is no single point of failure for in-cluster network.
 
-![topology](docs/ovn-network-topology.png "kube-ovn network topology")
+![newtopology](docs/new-ovn-network-topology.png "kube-ovn network topology")
 
 ## Monitoring Dashboard
 
