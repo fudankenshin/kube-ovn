@@ -16,7 +16,7 @@ on:
     - '**.md'
 
 env:
-  KIND_VERSION: v0.11.1
+  KIND_VERSION: v0.12.0
 
 jobs:
   build:
@@ -26,7 +26,7 @@ jobs:
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: 1.16.7
+          go-version: 1.17.8
         id: go
 
       - name: Check out code into the Go module directory
@@ -75,6 +75,18 @@ jobs:
           name: vpc-nat-gateway
           path: vpc-nat-gateway.tar
 
+      - name: Upload centos7-compile image to artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: centos7-compile
+          path: centos7-compile.tar
+
+#      - name: Upload centos8-compile image to artifact
+#        uses: actions/upload-artifact@v2
+#        with:
+#          name: centos8-compile
+#          path: centos8-compile.tar
+
   single-e2e:
     needs: build
     name: 1-master-e2e
@@ -101,15 +113,23 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -150,15 +170,23 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -199,15 +227,23 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -248,15 +284,23 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install-underlay
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-underlay
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -270,7 +314,7 @@ jobs:
         run: |
           sh -c 'while :; do if [ $(kubectl get --no-headers subnet | wc -l) -eq 2 ]; then break; fi; sleep 5; done'
           sh dist/images/cleanup.sh
-      
+
       - name: Check Node Network
         run: |
           sh -c '
@@ -313,15 +357,23 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install-single
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-single
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -362,10 +414,36 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+
+      - name: Run E2E
+        run: |
+          go install github.com/onsi/ginkgo/ginkgo@latest
+          sudo kubectl cluster-info
+          sudo chmod 666 /home/runner/.kube/config
+          make e2e
+
+      - name: Cleanup
+        run: |
+          sh -c 'while :; do if [ $(kubectl get --no-headers subnet | wc -l) -eq 2 ]; then break; fi; sleep 5; done'
+          sh dist/images/cleanup.sh
 
   ipv6-e2e:
     needs: build
@@ -398,14 +476,18 @@ jobs:
           docker load --input kube-ovn.tar
 
       - name: Install Kube-OVN
-        run: |
-          docker load --input kube-ovn.tar
-          sudo make kind-install-ipv6
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-ipv6
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -451,14 +533,18 @@ jobs:
           docker load --input kube-ovn.tar
 
       - name: Install Kube-OVN
-        run: |
-          docker load --input kube-ovn.tar
-          sudo make kind-install-ipv6
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-ipv6
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -504,14 +590,18 @@ jobs:
           docker load --input kube-ovn.tar
 
       - name: Install Kube-OVN
-        run: |
-          docker load --input kube-ovn.tar
-          sudo make kind-install-underlay-ipv6
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-underlay-ipv6
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -573,14 +663,18 @@ jobs:
           docker load --input kube-ovn.tar
 
       - name: Install Kube-OVN
-        run: |
-          docker load --input kube-ovn.tar
-          sudo make kind-install-dual
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-dual
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -626,14 +720,18 @@ jobs:
           docker load --input kube-ovn.tar
 
       - name: Install Kube-OVN
-        run: |
-          docker load --input kube-ovn.tar
-          sudo make kind-install-underlay-dual
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-underlay-dual
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -695,14 +793,18 @@ jobs:
           docker load --input kube-ovn.tar
 
       - name: Install Kube-OVN
-        run: |
-          docker load --input kube-ovn.tar
-          sudo make kind-install-underlay-logical-gateway-dual
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-underlay-logical-gateway-dual
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -759,17 +861,25 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN without LoadBalancer
-        env:
-          ENABLE_LB: "false"
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN without LoadBalancer
+        uses: nick-invision/retry@v2
+        env:
+          ENABLE_LB: "false"
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -810,17 +920,25 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN without LoadBalancer
-        env:
-          ENABLE_LB: "false"
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN without LoadBalancer
+        uses: nick-invision/retry@v2
+        env:
+          ENABLE_LB: "false"
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -861,17 +979,23 @@ jobs:
         with:
           name: kube-ovn
 
-      - name: Install Kube-OVN without network policy support
-        env:
-          ENABLE_NP: "false"
+      - name: Load Image
         run: |
           docker load --input kube-ovn.tar
-          sudo make kind-install
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo ENABLE_NP=false make kind-install
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: ^1.17
         id: go
 
       - name: Run E2E
@@ -885,6 +1009,179 @@ jobs:
         run: |
           sh -c 'while :; do if [ $(kubectl get --no-headers subnet | wc -l) -eq 2 ]; then break; fi; sleep 5; done'
           sh dist/images/cleanup.sh
+
+  multus-e2e:
+    needs: build
+    name: multus-e2e
+    runs-on: ubuntu-18.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv kind /usr/local/bin
+
+      - name: Init Kind
+        run: |
+          pip install j2cli --user
+          pip install "j2cli[yaml]" --user
+          sudo PATH=~/.local/bin:$PATH make kind-init
+
+      - name: Download image
+        uses: actions/download-artifact@v2
+        with:
+          name: kube-ovn
+
+      - name: Load Image
+        run: |
+          docker load --input kube-ovn.tar
+
+      - name: Install Kube-OVN & Multus
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo make kind-install-multus
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+
+      - name: Run E2E
+        run: |
+          go install github.com/onsi/ginkgo/ginkgo@latest
+          sudo kubectl cluster-info
+          sudo chmod 666 /home/runner/.kube/config
+          make e2e
+
+  ovnic-e2e:
+    needs: build
+    name: 1-master-ovnic-e2e
+    runs-on: ubuntu-18.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv kind /usr/local/bin
+
+      - name: Init Kind
+        run: |
+          pip install j2cli --user
+          pip install "j2cli[yaml]" --user
+          sudo PATH=~/.local/bin:$PATH make kind-init-cluster
+
+      - name: Download image
+        uses: actions/download-artifact@v2
+        with:
+          name: kube-ovn
+
+      - name: Load Image
+        run: |
+          docker load --input kube-ovn.tar
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: |
+            sudo PATH=~/.local/bin:$PATH make kind-install-cluster
+            sudo PATH=~/.local/bin:$PATH make kind-install-ic
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+
+      - name: Run E2E
+        run: |
+          go install github.com/onsi/ginkgo/ginkgo@latest
+          sudo kubectl cluster-info
+          sudo chmod -R 777 /home/runner/.kube/
+          make e2e-ovn-ic
+
+      - name: Cleanup
+        run: |
+          sh -c 'while :; do if [ $(kubectl get --no-headers subnet | wc -l) -eq 2 ]; then break; fi; sleep 5; done'
+          sh dist/images/cleanup.sh
+
+  cilium-e2e:
+    needs: build
+    name: 1-master-cilium-e2e
+    runs-on: ubuntu-20.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv kind /usr/local/bin
+
+      - name: Init Kind
+        run: |
+          sudo pip3 install j2cli
+          sudo pip3 install "j2cli[yaml]"
+          sudo PATH=~/.local/bin:$PATH make kind-init-cilium
+
+      - name: Download image
+        uses: actions/download-artifact@v2
+        with:
+          name: kube-ovn
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.4.0
+
+      - name: Load Image
+        run: |
+          docker load --input kube-ovn.tar
+
+      - name: Install Kube-OVN
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          shell: bash
+          command: sudo PATH=~/.local/bin:$PATH make kind-install-cilium
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.17
+        id: go
+
+      - name: Run E2E
+        run: |
+          go install github.com/onsi/ginkgo/ginkgo@latest
+          sudo kubectl cluster-info
+          sudo cp -r /root/.kube/ /home/runner/.kube/
+          sudo chmod -R 777 /home/runner/.kube/
+          docker exec kube-ovn-control-plane bash -c "ls -al /etc/cni/net.d/"
+          kubectl get pods -A
+          make e2e-ovn-ebpf
+
+      - name: Cleanup
+        run: |
+          sudo sh dist/images/cleanup.sh
 
   push:
     needs:
@@ -903,6 +1200,9 @@ jobs:
       - no-lb-e2e
       - no-lb-iptables-e2e
       - no-np-e2e
+      - multus-e2e
+      - ovnic-e2e
+      - cilium-e2e
     name: push
     runs-on: ubuntu-18.04
     steps:
@@ -919,10 +1219,22 @@ jobs:
         with:
           name: vpc-nat-gateway
 
+      - name: Download centos7-compile image
+        uses: actions/Download-artifact@v2
+        with:
+          name: centos7-compile
+
+#      - name: Download centos8-compile image
+#        uses: actions/Download-artifact@v2
+#        with:
+#          name: centos8-compile
+
       - name: Load Image
         run: |
           docker load --input kube-ovn.tar
           docker load --input vpc-nat-gateway.tar
+          docker load --input centos7-compile.tar
+          # docker load --input centos8-compile.tar
 
       - name: Security Scan
         run: |
@@ -932,7 +1244,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install trivy
           make scan
-
 
       - name: Push
         if: ${{ github.ref == 'refs/heads/master' || contains(github.ref, 'release') }}
@@ -948,8 +1259,16 @@ jobs:
           docker tag kubeovn/kube-ovn:$TAG kubeovn/kube-ovn:$TAG-x86
           docker tag kubeovn/vpc-nat-gateway:$TAG kubeovn/vpc-nat-gateway-dev:$COMMIT-x86
           docker tag kubeovn/vpc-nat-gateway:$TAG kubeovn/vpc-nat-gateway:$TAG-x86
+          docker tag kubeovn/centos7-compile:$TAG kubeovn/centos7-compile-dev:$TAG-x86
+          docker tag kubeovn/centos7-compile:$TAG kubeovn/centos7-compile:$TAG-x86
+          # docker tag kubeovn/centos8-compile:$TAG kubeovn/centos8-compile-dev:$TAG-x86
+          # docker tag kubeovn/centos8-compile:$TAG kubeovn/centos8-compile:$TAG-x86
           docker images
           docker push kubeovn/kube-ovn:$TAG-x86
           docker push kubeovn/kube-ovn-dev:$COMMIT-x86
           docker push kubeovn/vpc-nat-gateway:$TAG-x86
           docker push kubeovn/vpc-nat-gateway-dev:$COMMIT-x86
+          docker push kubeovn/centos7-compile:$TAG-x86
+          docker push kubeovn/centos7-compile-dev:$TAG-x86
+          # docker push kubeovn/centos8-compile:$TAG-x86
+          # docker push kubeovn/centos8-compile-dev:$TAG-x86

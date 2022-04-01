@@ -9,6 +9,9 @@ In Vlan mode, packets from pods will be sent directly to physical switches with 
 ![topology](vlan-topology.png "vlan network topology")
 
 To enable Vlan mode, a ~~dedicated~~ network interface is required by container network. Mac address, MTU, IP addresses and routes attached to the interface will be copied/transferred to an OVS bridge named `br-PROVIDER` where `PROVIDER` is name of the provider network.
+
+> NOTICE: If the provided interface is a bond device in mode 6 (a.k.a. balance-alb or adaptive load balancing), the OVS bridge will NOT contain the same Mac address. Instead, Kube-OVN assigns a generated Mac address with prefix `00:00:00` to the bridge.
+
 The related switch port must work in trunk mode to accept 802.1q packets. For underlay network with no vlan tag, you need
 to set the VLAN ID to 0.
 
@@ -24,11 +27,12 @@ From v1.7.1 on, Kube-OVN supports dynamic underlay/VLAN networking management.
 
 In the Vlan/Underlay mode, OVS sends origin Pods packets directly to the physical network and uses physical switch/router to transmit the traffic, so it relies on the capabilities of network infrastructure.
 
-1. For K8s running on VMs provided by OpenStack, `PortSecurity` of the network ports MUST be `disabled`;
-2. For K8s running on VMs provided by VMware, the switch security options `MAC Address Changes`, `Forged Transmits` and `Promiscuous Mode Operation` MUST be `allowed`;
-3. The Vlan/Underlay mode can not run on public IaaS providers like AWS/GCE/Alibaba Cloud as their network can not provide the capability to transmit this type packets;
-4. When Kube-OVN creates network it checks the connectivity to the subnet gateway through ICMP, so the gateway MUST respond the ICMP messages;
-5. For in-cluster service traffic, Pods set the dst mac to gateway mac and then Kube-OVN applies DNAT to transfer the dst ip, the packets will first be sent to the gateway, so the gateway MUST be capable of transmitting the packets back to the subnet.
+1. `hairpin` mode MUST be turned off on the switch/bridge ports to which the network interfaces are connected;
+2. For K8s running on VMs provided by OpenStack, `PortSecurity` of the network ports MUST be `disabled`;
+3. For K8s running on VMs provided by VMware, the switch security options `MAC Address Changes` and `Forged Transmits` MUST be `allowed`;
+4. The Vlan/Underlay mode can not run on public IaaS providers like AWS/GCE/Alibaba Cloud as their network can not provide the capability to transmit this type packets;
+5. In versions prior to v1.9.0, Kube-OVN checks the connectivity to the subnet gateway through ICMP, so the gateway MUST respond the ICMP messages if you are using those versions, or you can turn off the check by setting `disableGatewayCheck` to `true` which is introduced in v1.8.0;
+6. For in-cluster service traffic, Pods set the dst mac to gateway mac and then Kube-OVN applies DNAT to transfer the dst ip, the packets will first be sent to the gateway, so the gateway MUST be capable of transmitting the packets back to the subnet.
 
 ## Comparison with Macvlan
 
@@ -48,7 +52,7 @@ With default Vlan mode, Kube-OVN creates a default subnet named `ovn-default` wh
 
 1. Get the installation script
 
-`wget https://raw.githubusercontent.com/alauda/kube-ovn/release-1.8/dist/images/install.sh`
+`wget https://raw.githubusercontent.com/alauda/kube-ovn/release-1.9/dist/images/install.sh`
 
 2. Edit the `install.sh`, set `NETWORK_TYPE` to `vlan` and `VLAN_INTERFACE_NAME` to related host interface.
 
@@ -158,7 +162,7 @@ NOTICE: From v1.7.1 on, `hybrid` mode will be no longer supported since Kube-OVN
 
 1. Get the installation script
 
-`wget https://raw.githubusercontent.com/alauda/kube-ovn/release-1.8/dist/images/install.sh`
+`wget https://raw.githubusercontent.com/alauda/kube-ovn/release-1.9/dist/images/install.sh`
 
 2. Edit the `install.sh`, modify `NETWORK_TYPE` to `hybrid`, `VLAN_INTERFACE_NAME` to related host interface.
 > NOTE: if your nodes have different nic name for vlan device you could use regex for VLAN_INTERFACE_NAME or label those nodes with

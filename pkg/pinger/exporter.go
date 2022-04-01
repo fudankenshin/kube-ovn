@@ -6,12 +6,10 @@ import (
 	"time"
 
 	"github.com/greenpau/ovsdb"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
-const (
-	metricNamespace = "kube_ovn"
-)
+const metricNamespace = "kube_ovn"
 
 var (
 	appName       = "ovs-monitor"
@@ -115,6 +113,7 @@ func (e *Exporter) ovsMetricsUpdate() {
 }
 
 func (e *Exporter) exportOvsStatusGauge() {
+	metricOvsHealthyStatus.Reset()
 	result := e.getOvsStatus()
 	for k, v := range result {
 		if v {
@@ -126,6 +125,7 @@ func (e *Exporter) exportOvsStatusGauge() {
 }
 
 func (e *Exporter) exportOvsInfoGauge() {
+	metricOvsInfo.Reset()
 	if err := e.Client.GetSystemInfo(); err != nil {
 		klog.Errorf("Failed to get System Info")
 		return
@@ -136,6 +136,7 @@ func (e *Exporter) exportOvsInfoGauge() {
 }
 
 func (e *Exporter) exportOvsLogFileSizeGauge() {
+	metricLogFileSize.Reset()
 	components := []string{
 		"ovsdb-server",
 		"ovs-vswitchd",
@@ -152,6 +153,7 @@ func (e *Exporter) exportOvsLogFileSizeGauge() {
 }
 
 func (e *Exporter) exportOvsDbFileSizeGauge() {
+	metricDbFileSize.Reset()
 	database := "OVS_DB"
 	fileInfo, err := os.Stat(e.Client.Database.Vswitch.File.Data.Path)
 	if err != nil {
@@ -172,6 +174,7 @@ func (e *Exporter) exportOvsDpGauge() {
 		return
 	}
 
+	resetOvsDatapathMetrics()
 	for _, datapathName := range datapaths {
 		err = e.setOvsDpIfMetric(datapathName)
 		if err != nil {
@@ -187,6 +190,7 @@ func (e *Exporter) exportOvsInterfaceGauge() {
 		return
 	}
 
+	resetOvsInterfaceMetrics()
 	for _, intf := range intfs {
 		e.setOvsInterfaceMetric(intf)
 	}

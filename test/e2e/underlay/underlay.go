@@ -6,11 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -171,6 +172,45 @@ var _ = Describe("[Underlay]", func() {
 				}
 			}
 		})
+
+		It("node annotation", func() {
+			By("add exclude annotation")
+			nodes, err := f.KubeClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, node := range nodes.Items {
+				newNode := node.DeepCopy()
+				newNode.Annotations[fmt.Sprintf(util.ProviderNetworkExcludeTemplate, ProviderNetwork)] = "true"
+				_, err = f.KubeClientSet.CoreV1().Nodes().Update(context.Background(), newNode, metav1.UpdateOptions{})
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			time.Sleep(3 * time.Second)
+
+			By("validate provider network")
+			pn, err := f.OvnClientSet.KubeovnV1().ProviderNetworks().Get(context.Background(), ProviderNetwork, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			for _, node := range nodes.Items {
+				Expect(util.ContainsString(pn.Spec.ExcludeNodes, node.Name)).To(BeTrue())
+			}
+
+			By("validate node annotation")
+			nodes, err = f.KubeClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, node := range nodes.Items {
+				Expect(node.Annotations).NotTo(HaveKey(fmt.Sprintf(util.ProviderNetworkExcludeTemplate, ProviderNetwork)))
+			}
+
+			By("restore provider network")
+			pn, err = f.OvnClientSet.KubeovnV1().ProviderNetworks().Get(context.Background(), ProviderNetwork, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			newPn := pn.DeepCopy()
+			newPn.Spec.ExcludeNodes = nil
+			_, err = f.OvnClientSet.KubeovnV1().ProviderNetworks().Update(context.Background(), newPn, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		})
 	})
 
 	Context("[Subnet]", func() {
@@ -200,6 +240,7 @@ var _ = Describe("[Underlay]", func() {
 					CIDRBlock:      "99.11.0.0/16",
 					Vlan:           Vlan,
 					LogicalGateway: true,
+					Protocol:       util.CheckProtocol(cidr),
 				},
 			}
 			_, err := f.OvnClientSet.KubeovnV1().Subnets().Create(context.Background(), subnet, metav1.CreateOptions{})
@@ -210,9 +251,10 @@ var _ = Describe("[Underlay]", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("validate OVN logical router port")
-			ovnPods, err := f.KubeClientSet.CoreV1().Pods("kube-system").List(context.Background(), metav1.ListOptions{LabelSelector: "app=ovn-central"})
+			ovnPods, err := f.KubeClientSet.CoreV1().Pods("kube-system").List(context.Background(), metav1.ListOptions{LabelSelector: "app=ovn-central,ovn-nb-leader=true"})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ovnPods).NotTo(BeNil())
+			Expect(ovnPods.Items).To(HaveLen(1))
 
 			ovnPod := ovnPods.Items[0]
 			lsp := fmt.Sprintf("%s-%s", name, util.DefaultVpc)
@@ -241,6 +283,7 @@ var _ = Describe("[Underlay]", func() {
 					CIDRBlock:           "99.12.0.0/16",
 					Vlan:                Vlan,
 					DisableGatewayCheck: true,
+					Protocol:            util.CheckProtocol(cidr),
 				},
 			}
 			_, err := f.OvnClientSet.KubeovnV1().Subnets().Create(context.Background(), subnet, metav1.CreateOptions{})
@@ -574,7 +617,7 @@ var _ = Describe("[Underlay]", func() {
 
 					By("create pods")
 					name := f.GetName()
-					pods := make([]*corev1.Pod, 2)
+					pods := make([]*corev1.Pod, len(nodes))
 					var autoMount bool
 					for i := range nodes {
 						pods[i] = &corev1.Pod{
@@ -630,9 +673,9 @@ var _ = Describe("[Underlay]", func() {
 					return
 				}
 
-				defaultSubnet, err := f.OvnClientSet.KubeovnV1().Subnets().Get(context.Background(), "ovn-default", metav1.GetOptions{})
+				defaultSubnet, err := f.OvnClientSet.KubeovnV1().Subnets().Get(context.Background(), util.DefaultSubnet, metav1.GetOptions{})
 				if err != nil && !k8serrors.IsNotFound(err) {
-					klog.Fatalf("failed to get subnet ovn-default: %v", err)
+					klog.Fatalf("failed to get subnet %s: %v", util.DefaultSubnet, err)
 				}
 				if defaultSubnet.Spec.LogicalGateway {
 					return

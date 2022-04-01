@@ -6,8 +6,9 @@ import (
 	"os/exec"
 	"strings"
 
+	"k8s.io/klog/v2"
+
 	"github.com/kubeovn/kube-ovn/pkg/util"
-	"k8s.io/klog"
 )
 
 func checkOvs(config *Configuration) error {

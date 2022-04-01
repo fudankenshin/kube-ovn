@@ -10,8 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/sys/unix"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 )
@@ -156,22 +155,12 @@ func CheckProtocol(address string) string {
 	ip := net.ParseIP(address)
 	if ip.To4() != nil {
 		return kubeovnv1.ProtocolIPv4
+	} else if ip.To16() != nil {
+		return kubeovnv1.ProtocolIPv6
 	}
-	return kubeovnv1.ProtocolIPv6
-}
 
-// ProtocolToFamily converts protocol string to netlink family
-func ProtocolToFamily(protocol string) (int, error) {
-	switch protocol {
-	case kubeovnv1.ProtocolDual:
-		return unix.AF_UNSPEC, nil
-	case kubeovnv1.ProtocolIPv4:
-		return unix.AF_INET, nil
-	case kubeovnv1.ProtocolIPv6:
-		return unix.AF_INET6, nil
-	default:
-		return -1, fmt.Errorf("invalid protocol: %s", protocol)
-	}
+	// cidr formal error
+	return ""
 }
 
 func AddressCount(network *net.IPNet) float64 {
@@ -265,18 +254,10 @@ func SplitIpsByProtocol(excludeIps []string) ([]string, []string) {
 	var v4ExcludeIps, v6ExcludeIps []string
 	for _, ex := range excludeIps {
 		ips := strings.Split(ex, "..")
-		if len(ips) == 1 {
-			if net.ParseIP(ips[0]).To4() != nil {
-				v4ExcludeIps = append(v4ExcludeIps, ips[0])
-			} else {
-				v6ExcludeIps = append(v6ExcludeIps, ips[0])
-			}
+		if net.ParseIP(ips[0]).To4() != nil {
+			v4ExcludeIps = append(v4ExcludeIps, ex)
 		} else {
-			if net.ParseIP(ips[0]).To4() != nil {
-				v4ExcludeIps = append(v4ExcludeIps, ex)
-			} else {
-				v6ExcludeIps = append(v6ExcludeIps, ex)
-			}
+			v6ExcludeIps = append(v6ExcludeIps, ex)
 		}
 	}
 
@@ -432,7 +413,7 @@ func GatewayContains(gatewayNodeStr, gateway string) bool {
 		} else {
 			gw = strings.TrimSpace(gw)
 		}
-		if gw == gateway {
+		if gw == strings.TrimSpace(gateway) {
 			return true
 		}
 	}

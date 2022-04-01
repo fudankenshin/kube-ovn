@@ -39,11 +39,14 @@ func cidrConflict(cidr string) error {
 }
 
 func ValidateSubnet(subnet kubeovnv1.Subnet) error {
-	if !CIDRContainIP(subnet.Spec.CIDRBlock, subnet.Spec.Gateway) {
+	if subnet.Spec.Gateway != "" && !CIDRContainIP(subnet.Spec.CIDRBlock, subnet.Spec.Gateway) {
 		return fmt.Errorf(" gateway %s is not in cidr %s", subnet.Spec.Gateway, subnet.Spec.CIDRBlock)
 	}
 	if err := cidrConflict(subnet.Spec.CIDRBlock); err != nil {
 		return err
+	}
+	if CheckProtocol(subnet.Spec.CIDRBlock) == "" {
+		return fmt.Errorf("CIDRBlock: %s formal error", subnet.Spec.CIDRBlock)
 	}
 	excludeIps := subnet.Spec.ExcludeIps
 	for _, ipr := range excludeIps {
@@ -108,6 +111,13 @@ func ValidateSubnet(subnet kubeovnv1.Subnet) error {
 		}
 	}
 
+	if len(subnet.Spec.Vips) != 0 {
+		for _, vip := range subnet.Spec.Vips {
+			if !CIDRContainIP(subnet.Spec.CIDRBlock, vip) {
+				return fmt.Errorf("vip %s conflicts with subnet %s cidr %s", vip, subnet.Name, subnet.Spec.CIDRBlock)
+			}
+		}
+	}
 	return nil
 }
 
@@ -190,6 +200,26 @@ func ValidatePodCidr(cidr, ip string) error {
 			if SubnetNumber(cidrBlock) == ipStr {
 				return fmt.Errorf("%s is the network number ip in cidr %s", ipStr, cidrBlock)
 			}
+		}
+	}
+	return nil
+}
+
+func ValidateCidrConflict(subnet kubeovnv1.Subnet, subnetList []kubeovnv1.Subnet) error {
+	for _, sub := range subnetList {
+		if sub.Spec.Vpc != subnet.Spec.Vpc || sub.Spec.Vlan != subnet.Spec.Vlan || sub.Name == subnet.Name {
+			continue
+		}
+
+		if CIDRConflict(sub.Spec.CIDRBlock, subnet.Spec.CIDRBlock) {
+			err := fmt.Errorf("subnet %s cidr %s is conflict with subnet %s cidr %s", subnet.Name, subnet.Spec.CIDRBlock, sub.Name, sub.Spec.CIDRBlock)
+			return err
+		}
+
+		if subnet.Spec.ExternalEgressGateway != "" && sub.Spec.ExternalEgressGateway != "" &&
+			subnet.Spec.PolicyRoutingTableID == sub.Spec.PolicyRoutingTableID {
+			err := fmt.Errorf("subnet %s policy routing table ID %d is conflict with subnet %s policy routing table ID %d", subnet.Name, subnet.Spec.PolicyRoutingTableID, sub.Name, sub.Spec.PolicyRoutingTableID)
+			return err
 		}
 	}
 	return nil

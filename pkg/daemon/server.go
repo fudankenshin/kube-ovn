@@ -7,9 +7,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
+	"k8s.io/klog/v2"
+
 	"github.com/kubeovn/kube-ovn/pkg/request"
-	"k8s.io/klog"
 )
 
 var requestLogString = "[%s] Incoming %s %s %s request"

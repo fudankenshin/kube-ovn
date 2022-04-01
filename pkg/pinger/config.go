@@ -1,16 +1,17 @@
 package pinger
 
 import (
+	"context"
 	"flag"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
@@ -30,7 +31,6 @@ type Configuration struct {
 	HostIP             string
 	PodName            string
 	PodIP              string
-	PodIPs             []string
 	PodProtocols       []string
 	ExternalAddress    string
 	NetworkMode        string
@@ -80,12 +80,11 @@ func ParseFlags() (*Configuration, error) {
 		argServiceOvnControllerFileLogPath = pflag.String("service.ovncontroller.file.log.path", "/var/log/ovn/ovn-controller.log", "OVN controller daemon log file.")
 		argServiceOvnControllerFilePidPath = pflag.String("service.ovncontroller.file.pid.path", "/var/run/ovn/ovn-controller.pid", "OVN controller daemon process id file.")
 	)
-
 	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
 	klog.InitFlags(klogFlags)
 
 	// Sync the glog and klog flags.
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
+	pflag.CommandLine.VisitAll(func(f1 *pflag.Flag) {
 		f2 := klogFlags.Lookup(f1.Name)
 		if f2 != nil {
 			value := f1.Value.String()
@@ -111,7 +110,6 @@ func ParseFlags() (*Configuration, error) {
 		InternalDNS:        *argInternalDns,
 		ExternalDNS:        *argExternalDns,
 		PodIP:              os.Getenv("POD_IP"),
-		PodIPs:             strings.Split(os.Getenv("POD_IPS"), ","),
 		HostIP:             os.Getenv("HOST_IP"),
 		NodeName:           os.Getenv("NODE_NAME"),
 		PodName:            os.Getenv("POD_NAME"),
@@ -133,13 +131,36 @@ func ParseFlags() (*Configuration, error) {
 		ServiceOvnControllerFileLogPath: *argServiceOvnControllerFileLogPath,
 		ServiceOvnControllerFilePidPath: *argServiceOvnControllerFilePidPath,
 	}
-	config.PodProtocols = make([]string, len(config.PodIPs))
-	for i, podIP := range config.PodIPs {
-		config.PodProtocols[i] = util.CheckProtocol(podIP)
-	}
-
 	if err := config.initKubeClient(); err != nil {
 		return nil, err
+	}
+
+	podName := os.Getenv("POD_NAME")
+	for i := 0; i < 3; i++ {
+		pod, err := config.KubeClient.CoreV1().Pods("kube-system").Get(context.Background(), podName, metav1.GetOptions{})
+		if err != nil {
+			klog.Errorf("failed to get self pod kube-system/%s: %v", podName, err)
+			return nil, err
+		}
+
+		if len(pod.Status.PodIPs) != 0 {
+			config.PodProtocols = make([]string, len(pod.Status.PodIPs))
+			for i, podIP := range pod.Status.PodIPs {
+				config.PodProtocols[i] = util.CheckProtocol(podIP.IP)
+			}
+			break
+		}
+
+		if pod.Status.ContainerStatuses[0].Ready {
+			klog.Fatalf("failed to get IPs of Pod kube-system/%s", podName)
+		}
+
+		klog.Infof("cannot get Pod IPs now, waiting Pod to be ready")
+		time.Sleep(time.Second)
+	}
+
+	if len(config.PodProtocols) == 0 {
+		klog.Fatalf("failed to get IPs of Pod kube-system/%s after 3 attempts", podName)
 	}
 
 	klog.Infof("pinger config is %+v", config)

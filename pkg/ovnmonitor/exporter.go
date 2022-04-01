@@ -2,21 +2,22 @@ package ovnmonitor
 
 import (
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
 	"github.com/greenpau/ovsdb"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
-const (
-	metricNamespace = "kube_ovn"
-)
+const metricNamespace = "kube_ovn"
 
 var (
 	appName          = "ovn-monitor"
 	isClusterEnabled = true
 	tryConnectCnt    = 0
+	checkNbDbCnt     = 0
+	checkSbDbCnt     = 0
 )
 
 // Exporter collects OVN data from the given server and exports them using
@@ -146,6 +147,7 @@ func (e *Exporter) ovnMetricsUpdate() {
 		e.exportOvnLogFileSizeGauge()
 		e.exportOvnDBFileSizeGauge()
 		e.exportOvnRequestErrorGauge()
+		e.exportOvnDBStatusGauge()
 
 		e.exportOvnChassisGauge()
 		e.exportLogicalSwitchGauge()
@@ -166,6 +168,7 @@ func GetExporterName() string {
 }
 
 func (e *Exporter) exportOvnStatusGauge() {
+	metricOvnHealthyStatus.Reset()
 	result := e.getOvnStatus()
 	for k, v := range result {
 		metricOvnHealthyStatus.WithLabelValues(e.Client.System.Hostname, k).Set(float64(v))
@@ -173,6 +176,7 @@ func (e *Exporter) exportOvnStatusGauge() {
 }
 
 func (e *Exporter) exportOvnLogFileSizeGauge() {
+	metricLogFileSize.Reset()
 	components := []string{
 		"ovsdb-server-southbound",
 		"ovsdb-server-northbound",
@@ -190,6 +194,7 @@ func (e *Exporter) exportOvnLogFileSizeGauge() {
 }
 
 func (e *Exporter) exportOvnDBFileSizeGauge() {
+	metricDBFileSize.Reset()
 	nbPath := e.Client.Database.Northbound.File.Data.Path
 	sbPath := e.Client.Database.Southbound.File.Data.Path
 	dirDbMap := map[string]string{
@@ -211,6 +216,7 @@ func (e *Exporter) exportOvnRequestErrorGauge() {
 }
 
 func (e *Exporter) exportOvnChassisGauge() {
+	metricChassisInfo.Reset()
 	if vteps, err := e.Client.GetChassis(); err != nil {
 		klog.Errorf("%s: %v", e.Client.Database.Southbound.Name, err)
 		e.IncrementErrorCounter()
@@ -222,14 +228,17 @@ func (e *Exporter) exportOvnChassisGauge() {
 }
 
 func (e *Exporter) exportLogicalSwitchGauge() {
+	resetLogicalSwitchMetrics()
 	e.setLogicalSwitchInfoMetric()
 }
 
 func (e *Exporter) exportLogicalSwitchPortGauge() {
+	resetLogicalSwitchPortMetrics()
 	e.setLogicalSwitchPortInfoMetric()
 }
 
 func (e *Exporter) exportOvnClusterEnableGauge() {
+	metricClusterEnabled.Reset()
 	isClusterEnabled, err := getClusterEnableState(e.Client.Database.Northbound.File.Data.Path)
 	if err != nil {
 		klog.Errorf("failed to get output of cluster status: %v", err)
@@ -242,6 +251,7 @@ func (e *Exporter) exportOvnClusterEnableGauge() {
 }
 
 func (e *Exporter) exportOvnClusterInfoGauge() {
+	resetOvnClusterMetrics()
 	dirDbMap := map[string]string{
 		"nb": "OVN_Northbound",
 		"sb": "OVN_Southbound",
@@ -253,5 +263,49 @@ func (e *Exporter) exportOvnClusterInfoGauge() {
 			return
 		}
 		e.setOvnClusterInfoMetric(clusterStatus, database)
+	}
+}
+
+func (e *Exporter) exportOvnDBStatusGauge() {
+	metricDBStatus.Reset()
+	dbList := []string{"OVN_Northbound", "OVN_Southbound"}
+	for _, database := range dbList {
+		ok, err := getDBStatus(database)
+		if err != nil {
+			klog.Errorf("Failed to get DB status for %s: %v", database, err)
+			return
+		}
+		if ok {
+			metricDBStatus.WithLabelValues(e.Client.System.Hostname, database).Set(1)
+		} else {
+			metricDBStatus.WithLabelValues(e.Client.System.Hostname, database).Set(0)
+
+			switch database {
+			case "OVN_Northbound":
+				checkNbDbCnt++
+				if checkNbDbCnt < 6 {
+					klog.Warningf("Failed to get OVN NB DB status for %v times", checkNbDbCnt)
+					return
+				} else {
+					klog.Warningf("Failed to get OVN NB DB status for %v times, ready to restore OVN DB", checkNbDbCnt)
+					checkNbDbCnt = 0
+				}
+			case "OVN_Southbound":
+				checkSbDbCnt++
+				if checkSbDbCnt < 6 {
+					klog.Warningf("Failed to get OVN SB DB status for %v times", checkSbDbCnt)
+					return
+				} else {
+					klog.Warningf("Failed to get OVN SB DB status for %v times, ready to restore OVN DB", checkSbDbCnt)
+					checkSbDbCnt = 0
+				}
+			}
+
+			output, err := exec.Command("/bin/bash", "/kube-ovn/restore-ovn-nb-db.sh").CombinedOutput()
+			if err != nil {
+				klog.Errorf("Failed to restore OVN DB, err %v", err)
+			}
+			klog.Infof("restore OVN DB %v, process output %v", database, string(output))
+		}
 	}
 }

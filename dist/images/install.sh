@@ -12,16 +12,20 @@ VLAN_NIC=${VLAN_NIC:-}
 HW_OFFLOAD=${HW_OFFLOAD:-false}
 ENABLE_LB=${ENABLE_LB:-true}
 ENABLE_NP=${ENABLE_NP:-true}
+WITHOUT_KUBE_PROXY=${WITHOUT_KUBE_PROXY:-false}
 ENABLE_EXTERNAL_VPC=${ENABLE_EXTERNAL_VPC:-true}
+CNI_CONFIG_PRIORITY=${CNI_CONFIG_PRIORITY:-01}
 # The nic to support container network can be a nic name or a group of regex
 # separated by comma, if empty will use the nic that the default route use
 IFACE=${IFACE:-}
+# Specifies the name of the dpdk tunnel iface.
+DPDK_TUNNEL_IFACE=${DPDK_TUNNEL_IFACE:-br-phy}
 
 CNI_CONF_DIR="/etc/cni/net.d"
 CNI_BIN_DIR="/opt/cni/bin"
 
 REGISTRY="kubeovn"
-VERSION="v1.9.0"
+VERSION="v1.10.0"
 IMAGE_PULL_POLICY="IfNotPresent"
 POD_CIDR="10.16.0.0/16"                # Do NOT overlap with NODE/SVC/JOIN CIDR
 POD_GATEWAY="10.16.0.1"
@@ -41,7 +45,7 @@ fi
 if [ "$DUAL_STACK" = "true" ]; then
   POD_CIDR="10.16.0.0/16,fd00:10:16::/64"                # Do NOT overlap with NODE/SVC/JOIN CIDR
   POD_GATEWAY="10.16.0.1,fd00:10:16::1"
-  SVC_CIDR="10.96.0.0/12"                                # Do NOT overlap with NODE/POD/JOIN CIDR
+  SVC_CIDR="10.96.0.0/12,fd00:10:96::/112"               # Do NOT overlap with NODE/POD/JOIN CIDR
   JOIN_CIDR="100.64.0.0/16,fd00:100:64::/64"             # Do NOT overlap with NODE/POD/SVC CIDR
   PINGER_EXTERNAL_ADDRESS="114.114.114.114,2400:3200::1"
   PINGER_EXTERNAL_DOMAIN="google.com"
@@ -67,6 +71,9 @@ if [ "$ENABLE_VLAN" = "true" ]; then
   fi
 fi
 
+# hybrid dpdk
+HYBRID_DPDK="false"
+
 # DPDK
 DPDK="false"
 DPDK_SUPPORTED_VERSIONS=("19.11")
@@ -74,10 +81,15 @@ DPDK_VERSION=""
 DPDK_CPU="1000m"                        # Default CPU configuration for if --dpdk-cpu flag is not included
 DPDK_MEMORY="2Gi"                       # Default Memory configuration for it --dpdk-memory flag is not included
 
+# performance
+MODULES="kube_ovn_fastpath.ko"
+RPMS="openvswitch-kmod"
+
 display_help() {
     echo "Usage: $0 [option...]"
     echo
     echo "  -h, --help               Print Help (this message) and exit"
+    echo "  --with-hybrid-dpdk       Install Kube-OVN with nodes which run ovs-dpdk or ovs-kernel"
     echo "  --with-dpdk=<version>    Install Kube-OVN with OVS-DPDK instead of kernel OVS"
     echo "  --dpdk-cpu=<amount>m     Configure DPDK to use a specific amount of CPU"
     echo "  --dpdk-memory=<amount>Gi Configure DPDK to use a specific amount of memory"
@@ -92,6 +104,9 @@ then
     case $1 in
       -h|--help)
         display_help
+      ;;
+      --with-hybrid-dpdk)
+      HYBRID_DPDK="true"
       ;;
       --with-dpdk=*)
         DPDK=true
@@ -133,6 +148,20 @@ then
   set -u
 fi
 
+echo "-------------------------------"
+echo "Kube-OVN Version:     $VERSION"
+echo "Default Network Mode: $NETWORK_TYPE"
+if [[ $NETWORK_TYPE = "vlan" ]];then
+  echo "Default Vlan Nic:     $VLAN_INTERFACE_NAME"
+  echo "Default Vlan ID:      $VLAN_ID"
+fi
+echo "Default Subnet CIDR:  $POD_CIDR"
+echo "Join Subnet CIDR:     $JOIN_CIDR"
+echo "Enable SVC LB:        $ENABLE_LB"
+echo "Enable Networkpolicy: $ENABLE_NP"
+echo "Enable Mirror:        $ENABLE_MIRROR"
+echo "-------------------------------"
+
 if [[ $ENABLE_SSL = "true" ]];then
   echo "[Step 0/6] Generate SSL key and cert"
   exist=$(kubectl get secret -n kube-system kube-ovn-tls --ignore-not-found)
@@ -145,7 +174,7 @@ if [[ $ENABLE_SSL = "true" ]];then
   echo ""
 fi
 
-echo "[Step 1/6] Label kube-ovn-master node"
+echo "[Step 1/6] Label kube-ovn-master node and label datapath type"
 count=$(kubectl get no -l$LABEL --no-headers -o wide | wc -l | sed 's/ //g')
 if [ "$count" = "0" ]; then
   echo "ERROR: No node with label $LABEL"
@@ -153,6 +182,9 @@ if [ "$count" = "0" ]; then
 fi
 kubectl label no -lbeta.kubernetes.io/os=linux kubernetes.io/os=linux --overwrite
 kubectl label no -l$LABEL kube-ovn/role=master --overwrite
+
+kubectl label no -lovn.kubernetes.io/ovs_dp_type!=userspace ovn.kubernetes.io/ovs_dp_type=kernel  --overwrite
+
 echo "-------------------------------"
 echo ""
 
@@ -245,6 +277,10 @@ spec:
                   type: string
                 vpc:
                   type: string
+                selector:
+                  type: array
+                  items:
+                    type: string
       subresources:
         status: {}
   conversion:
@@ -301,6 +337,15 @@ spec:
                         type: string
                     type: object
                   type: array
+                vpcPeerings:
+                  items:
+                    properties:
+                      remoteVpc:
+                        type: string
+                      localConnectIP:
+                        type: string
+                    type: object
+                  type: array
               type: object
             status:
               properties:
@@ -330,6 +375,10 @@ spec:
                 standby:
                   type: boolean
                 subnets:
+                  items:
+                    type: string
+                  type: array
+                vpcPeerings:
                   items:
                     type: string
                   type: array
@@ -496,6 +545,10 @@ spec:
                   type: number
                 activateGateway:
                   type: string
+                dhcpV4OptionsUUID:
+                  type: string
+                dhcpV6OptionsUUID:
+                  type: string
                 conditions:
                   type: array
                   items:
@@ -522,6 +575,10 @@ spec:
                   type: boolean
                 protocol:
                   type: string
+                  enum:
+                    - IPv4
+                    - IPv6
+                    - Dual
                 cidrBlock:
                   type: string
                 namespaces:
@@ -533,6 +590,10 @@ spec:
                 provider:
                   type: string
                 excludeIps:
+                  type: array
+                  items:
+                    type: string
+                vips:
                   type: array
                   items:
                     type: string
@@ -574,6 +635,40 @@ spec:
                   type: boolean
                 htbqos:
                   type: string
+                enableDHCP:
+                  type: boolean
+                dhcpV4Options:
+                  type: string
+                dhcpV6Options:
+                  type: string
+                enableIPv6RA:
+                  type: boolean
+                ipv6RAConfigs:
+                  type: string
+                acls:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      direction:
+                        type: string
+                        enum:
+                          - from-lport
+                          - to-lport
+                      priority:
+                        type: integer
+                        minimum: 0
+                        maximum: 32767
+                      match:
+                        type: string
+                      action:
+                        type: string
+                        enum:
+                          - allow-related
+                          - allow-stateless
+                          - allow
+                          - drop
+                          - reject
   scope: Cluster
   names:
     plural: subnets
@@ -592,6 +687,8 @@ spec:
     - name: v1
       served: true
       storage: true
+      subresources:
+        status: {}
       schema:
         openAPIV3Schema:
           type: object
@@ -645,6 +742,8 @@ spec:
     - name: v1
       served: true
       storage: true
+      subresources:
+        status: {}
       schema:
         openAPIV3Schema:
           type: object
@@ -858,36 +957,6 @@ EOF
 
 if $DPDK; then
   cat <<EOF > ovn.yaml
-apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
-metadata:
-  name: kube-ovn
-  annotations:
-    seccomp.security.alpha.kubernetes.io/allowedProfileNames: '*'
-spec:
-  privileged: true
-  allowPrivilegeEscalation: true
-  allowedCapabilities:
-    - '*'
-  volumes:
-    - '*'
-  hostNetwork: true
-  hostPorts:
-    - min: 0
-      max: 65535
-  hostIPC: true
-  hostPID: true
-  runAsUser:
-    rule: 'RunAsAny'
-  seLinux:
-    rule: 'RunAsAny'
-  supplementalGroups:
-    rule: 'RunAsAny'
-  fsGroup:
-    rule: 'RunAsAny'
-
----
-
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -919,10 +988,14 @@ rules:
   - apiGroups:
       - "kubeovn.io"
     resources:
+      - vpcs
+      - vpcs/status
+      - vpc-nat-gateways
       - subnets
       - subnets/status
       - ips
       - vlans
+      - vlans/status
       - provider-networks
       - provider-networks/status
       - security-groups
@@ -967,6 +1040,7 @@ rules:
       - statefulsets
       - daemonsets
       - deployments
+      - deployments/scale
     verbs:
       - create
       - delete
@@ -983,7 +1057,24 @@ rules:
       - create
       - patch
       - update
-
+  - apiGroups:
+      - "k8s.cni.cncf.io"
+    resources:
+      - network-attachment-definitions
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - update
+  - apiGroups:
+      - "kubevirt.io"
+    resources:
+      - virtualmachines
+      - virtualmachineinstances
+    verbs:
+      - get
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -1081,7 +1172,12 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1123,7 +1219,7 @@ spec:
               memory: 300Mi
             limits:
               cpu: 3
-              memory: 3Gi
+              memory: 4Gi
           volumeMounts:
             - mountPath: /var/run/openvswitch
               name: host-run-ovs
@@ -1148,8 +1244,8 @@ spec:
             exec:
               command:
                 - bash
-                - /kube-ovn/ovn-is-leader.sh
-            periodSeconds: 3
+                - /kube-ovn/ovn-healthcheck.sh
+            periodSeconds: 15
             timeoutSeconds: 45
           livenessProbe:
             exec:
@@ -1157,7 +1253,7 @@ spec:
                 - bash
                 - /kube-ovn/ovn-healthcheck.sh
             initialDelaySeconds: 30
-            periodSeconds: 7
+            periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 45
       nodeSelector:
@@ -1216,7 +1312,12 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1297,6 +1398,7 @@ spec:
               hugepages-1Gi: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
+        ovn.kubernetes.io/ovs_dp_type: "kernel"
       volumes:
         - name: host-modules
           hostPath:
@@ -1343,36 +1445,6 @@ EOF
 
 else
   cat <<EOF > ovn.yaml
-apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
-metadata:
-  name: kube-ovn
-  annotations:
-    seccomp.security.alpha.kubernetes.io/allowedProfileNames: '*'
-spec:
-  privileged: true
-  allowPrivilegeEscalation: true
-  allowedCapabilities:
-    - '*'
-  volumes:
-    - '*'
-  hostNetwork: true
-  hostPorts:
-    - min: 0
-      max: 65535
-  hostIPC: true
-  hostPID: true
-  runAsUser:
-    rule: 'RunAsAny'
-  seLinux:
-    rule: 'RunAsAny'
-  supplementalGroups:
-    rule: 'RunAsAny'
-  fsGroup:
-    rule: 'RunAsAny'
-
----
-
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1409,9 +1481,9 @@ rules:
       - subnets/status
       - ips
       - vlans
+      - vlans/status
       - provider-networks
       - provider-networks/status
-      - networks
       - security-groups
       - security-groups/status
       - htbqoses
@@ -1444,6 +1516,7 @@ rules:
       - statefulsets
       - daemonsets
       - deployments
+      - deployments/scale
     verbs:
       - create
       - delete
@@ -1470,6 +1543,14 @@ rules:
       - get
       - list
       - update
+  - apiGroups:
+      - "kubevirt.io"
+    resources:
+      - virtualmachines
+      - virtualmachineinstances
+    verbs:
+      - get
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -1564,7 +1645,12 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1606,7 +1692,7 @@ spec:
               memory: 200Mi
             limits:
               cpu: 3
-              memory: 3Gi
+              memory: 4Gi
           volumeMounts:
             - mountPath: /var/run/openvswitch
               name: host-run-ovs
@@ -1631,8 +1717,8 @@ spec:
             exec:
               command:
                 - bash
-                - /kube-ovn/ovn-is-leader.sh
-            periodSeconds: 3
+                - /kube-ovn/ovn-healthcheck.sh
+            periodSeconds: 15
             timeoutSeconds: 45
           livenessProbe:
             exec:
@@ -1640,7 +1726,7 @@ spec:
                 - bash
                 - /kube-ovn/ovn-healthcheck.sh
             initialDelaySeconds: 30
-            periodSeconds: 7
+            periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 45
       nodeSelector:
@@ -1698,7 +1784,12 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1779,6 +1870,7 @@ spec:
               memory: 800Mi
       nodeSelector:
         kubernetes.io/os: "linux"
+        ovn.kubernetes.io/ovs_dp_type: kernel
       volumes:
         - name: host-modules
           hostPath:
@@ -1819,7 +1911,175 @@ fi
 
 kubectl apply -f kube-ovn-crd.yaml
 kubectl apply -f ovn.yaml
-kubectl rollout status deployment/ovn-central -n kube-system
+
+if $HYBRID_DPDK; then
+
+cat <<EOF > ovn-dpdk.yaml
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: ovs-ovn-dpdk
+  namespace: kube-system
+  annotations:
+    kubernetes.io/description: |
+      This daemon set launches the openvswitch daemon.
+spec:
+  selector:
+    matchLabels:
+      app: ovs-dpdk
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app: ovs-dpdk
+        component: network
+        type: infra
+    spec:
+      tolerations:
+      - operator: Exists
+      priorityClassName: system-cluster-critical
+      serviceAccountName: ovn
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: openvswitch
+          image: "$REGISTRY/kube-ovn:${VERSION}-dpdk"
+          imagePullPolicy: $IMAGE_PULL_POLICY
+          command: ["/kube-ovn/start-ovs-dpdk-v2.sh"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          env:
+            - name: ENABLE_SSL
+              value: "$ENABLE_SSL"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HW_OFFLOAD
+              value: "$HW_OFFLOAD"
+            - name: TUNNEL_TYPE
+              value: "$TUNNEL_TYPE"
+            - name: DPDK_TUNNEL_IFACE
+              value: "$DPDK_TUNNEL_IFACE"
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: OVN_DB_IPS
+              value: $addresses
+          volumeMounts:
+            - mountPath: /opt/ovs-config
+              name: host-config-ovs
+            - name: shareddir
+              mountPath: /var/lib/kubelet/pods
+            - name: hugepage
+              mountPath: /dev/hugepages
+            - mountPath: /lib/modules
+              name: host-modules
+              readOnly: true
+            - mountPath: /var/run/openvswitch
+              name: host-run-ovs
+              mountPropagation: HostToContainer
+            - mountPath: /var/run/ovn
+              name: host-run-ovn
+            - mountPath: /sys
+              name: host-sys
+              readOnly: true
+            - mountPath: /etc/cni/net.d
+              name: cni-conf
+            - mountPath: /etc/openvswitch
+              name: host-config-openvswitch
+            - mountPath: /etc/ovn
+              name: host-config-ovn
+            - mountPath: /var/log/openvswitch
+              name: host-log-ovs
+            - mountPath: /var/log/ovn
+              name: host-log-ovn
+            - mountPath: /etc/localtime
+              name: localtime
+            - mountPath: /var/run/tls
+              name: kube-ovn-tls
+          readinessProbe:
+            exec:
+              command:
+                - bash
+                - -c
+                - LOG_ROTATE=true /kube-ovn/ovs-healthcheck.sh
+            periodSeconds: 5
+            timeoutSeconds: 45
+          livenessProbe:
+            exec:
+              command:
+                - bash
+                - /kube-ovn/ovs-healthcheck.sh
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 5
+            timeoutSeconds: 45
+          resources:
+            requests:
+              cpu: 200m
+              hugepages-2Mi: 1Gi
+              memory: 200Mi
+            limits:
+              cpu: 1000m
+              hugepages-2Mi: 1Gi
+              memory: 800Mi
+      nodeSelector:
+        kubernetes.io/os: "linux"
+        ovn.kubernetes.io/ovs_dp_type: "userspace"
+      volumes:
+        - name: host-config-ovs
+          hostPath:
+            path: /opt/ovs-config
+            type: DirectoryOrCreate
+        - name: shareddir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: ''
+        - name: hugepage
+          emptyDir:
+            medium: HugePages
+        - name: host-modules
+          hostPath:
+            path: /lib/modules
+        - name: host-run-ovs
+          hostPath:
+            path: /run/openvswitch
+        - name: host-run-ovn
+          hostPath:
+            path: /run/ovn
+        - name: host-sys
+          hostPath:
+            path: /sys
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+        - name: host-config-openvswitch
+          hostPath:
+            path: /etc/origin/openvswitch
+        - name: host-config-ovn
+          hostPath:
+            path: /etc/origin/ovn
+        - name: host-log-ovs
+          hostPath:
+            path: /var/log/openvswitch
+        - name: host-log-ovn
+          hostPath:
+            path: /var/log/ovn
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+        - name: kube-ovn-tls
+          secret:
+            optional: true
+            secretName: kube-ovn-tls
+EOF
+kubectl apply -f ovn-dpdk.yaml
+fi
+kubectl rollout status deployment/ovn-central -n kube-system --timeout 300s
 echo "-------------------------------"
 echo ""
 
@@ -1853,7 +2113,10 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1888,6 +2151,7 @@ spec:
           - --logtostderr=false
           - --alsologtostderr=true
           - --log_file=/var/log/kube-ovn/kube-ovn-controller.log
+          - --log_file_max_size=0
           env:
             - name: ENABLE_SSL
               value: "$ENABLE_SSL"
@@ -1915,15 +2179,13 @@ spec:
           readinessProbe:
             exec:
               command:
-                - bash
-                - /kube-ovn/kube-ovn-controller-healthcheck.sh
+                - /kube-ovn/kube-ovn-controller-healthcheck
             periodSeconds: 3
             timeoutSeconds: 45
           livenessProbe:
             exec:
               command:
-                - bash
-                - /kube-ovn/kube-ovn-controller-healthcheck.sh
+                - /kube-ovn/kube-ovn-controller-healthcheck
             initialDelaySeconds: 300
             periodSeconds: 7
             failureThreshold: 5
@@ -1970,7 +2232,12 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1998,11 +2265,14 @@ spec:
           - --encap-checksum=true
           - --service-cluster-ip-range=$SVC_CIDR
           - --iface=${IFACE}
+          - --dpdk-tunnel-iface=${DPDK_TUNNEL_IFACE}
           - --network-type=$NETWORK_TYPE
           - --default-interface-name=$VLAN_INTERFACE_NAME
+          - --cni-conf-name=${CNI_CONFIG_PRIORITY}-kube-ovn.conflist
           - --logtostderr=false
           - --alsologtostderr=true
           - --log_file=/var/log/kube-ovn/kube-ovn-cni.log
+          - --log_file_max_size=0
         securityContext:
           runAsUser: 0
           privileged: true
@@ -2017,13 +2287,20 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: spec.nodeName
+          - name: MODULES
+            value: $MODULES
+          - name: RPMS
+            value: $RPMS
         volumeMounts:
+          - name: shared-dir
+            mountPath: /var/lib/kubelet/pods
           - mountPath: /etc/openvswitch
             name: systemid
           - mountPath: /etc/cni/net.d
             name: cni-conf
           - mountPath: /run/openvswitch
             name: host-run-ovs
+            mountPropagation: Bidirectional
           - mountPath: /run/ovn
             name: host-run-ovn
           - mountPath: /var/run/netns
@@ -2031,28 +2308,30 @@ spec:
             mountPropagation: HostToContainer
           - mountPath: /var/log/kube-ovn
             name: kube-ovn-log
+          - mountPath: /var/log/openvswitch
+            name: host-log-ovs
+          - mountPath: /var/log/ovn
+            name: host-log-ovn
           - mountPath: /etc/localtime
             name: localtime
-        readinessProbe:
-          exec:
-            command:
-              - nc
-              - -z
-              - -w3
-              - 127.0.0.1
-              - "10665"
-          periodSeconds: 3
+          - mountPath: /tmp
+            name: tmp
         livenessProbe:
-          exec:
-            command:
-              - nc
-              - -z
-              - -w3
-              - 127.0.0.1
-              - "10665"
+          failureThreshold: 3
           initialDelaySeconds: 30
           periodSeconds: 7
-          failureThreshold: 5
+          successThreshold: 1
+          tcpSocket:
+            port: 10665
+          timeoutSeconds: 3
+        readinessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 30
+          periodSeconds: 7
+          successThreshold: 1
+          tcpSocket:
+            port: 10665
+          timeoutSeconds: 3
         resources:
           requests:
             cpu: 100m
@@ -2063,6 +2342,9 @@ spec:
       nodeSelector:
         kubernetes.io/os: "linux"
       volumes:
+        - name: shared-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
         - name: systemid
           hostPath:
             path: /etc/origin/openvswitch
@@ -2081,12 +2363,21 @@ spec:
         - name: host-ns
           hostPath:
             path: /var/run/netns
+        - name: host-log-ovs
+          hostPath:
+            path: /var/log/openvswitch
         - name: kube-ovn-log
           hostPath:
             path: /var/log/kube-ovn
+        - name: host-log-ovn
+          hostPath:
+            path: /var/log/ovn
         - name: localtime
           hostPath:
             path: /etc/localtime
+        - name: tmp
+          hostPath:
+            path: /tmp
 
 ---
 kind: DaemonSet
@@ -2123,6 +2414,7 @@ spec:
           - --logtostderr=false
           - --alsologtostderr=true
           - --log_file=/var/log/kube-ovn/kube-ovn-pinger.log
+          - --log_file_max_size=0
           imagePullPolicy: $IMAGE_PULL_POLICY
           securityContext:
             runAsUser: 0
@@ -2134,10 +2426,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            - name: POD_IPS
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIPs
             - name: HOST_IP
               valueFrom:
                 fieldRef:
@@ -2226,10 +2514,10 @@ metadata:
     kubernetes.io/description: |
       Metrics for OVN components: northd, nb and sb.
 spec:
-  replicas: $count
+  replicas: 1
   strategy:
     rollingUpdate:
-      maxSurge: 0
+      maxSurge: 1
       maxUnavailable: 1
     type: RollingUpdate
   selector:
@@ -2243,7 +2531,12 @@ spec:
         type: infra
     spec:
       tolerations:
-      - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -2265,8 +2558,6 @@ spec:
           env:
             - name: ENABLE_SSL
               value: "$ENABLE_SSL"
-            - name: NODE_IPS
-              value: $addresses
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -2283,9 +2574,6 @@ spec:
               name: host-run-ovs
             - mountPath: /var/run/ovn
               name: host-run-ovn
-            - mountPath: /sys
-              name: host-sys
-              readOnly: true
             - mountPath: /etc/openvswitch
               name: host-config-openvswitch
             - mountPath: /etc/ovn
@@ -2303,13 +2591,13 @@ spec:
               command:
               - cat
               - /var/run/ovn/ovnnb_db.pid
-            periodSeconds: 3
+            periodSeconds: 10
             timeoutSeconds: 45
           livenessProbe:
             exec:
               command:
               - cat
-              - /var/run/ovn/ovn-nbctl.pid
+              - /var/run/ovn/ovnnb_db.pid
             initialDelaySeconds: 30
             periodSeconds: 10
             failureThreshold: 5
@@ -2324,9 +2612,6 @@ spec:
         - name: host-run-ovn
           hostPath:
             path: /run/ovn
-        - name: host-sys
-          hostPath:
-            path: /sys
         - name: host-config-openvswitch
           hostPath:
             path: /etc/origin/openvswitch
@@ -2411,20 +2696,21 @@ spec:
 EOF
 
 kubectl apply -f kube-ovn.yaml
-kubectl rollout status deployment/kube-ovn-controller -n kube-system
-kubectl rollout status daemonset/kube-ovn-cni -n kube-system
+kubectl rollout status deployment/kube-ovn-controller -n kube-system --timeout 300s
+kubectl rollout status daemonset/kube-ovn-cni -n kube-system --timeout 300s
 echo "-------------------------------"
 echo ""
 
 echo "[Step 4/6] Delete pod that not in host network mode"
-for ns in $(kubectl get ns --no-headers -o  custom-columns=NAME:.metadata.name); do
+for ns in $(kubectl get ns --no-headers -o custom-columns=NAME:.metadata.name); do
   for pod in $(kubectl get pod --no-headers -n "$ns" --field-selector spec.restartPolicy=Always -o custom-columns=NAME:.metadata.name,HOST:spec.hostNetwork | awk '{if ($2!="true") print $1}'); do
     kubectl delete pod "$pod" -n "$ns" --ignore-not-found
   done
 done
 
-kubectl rollout status daemonset/kube-ovn-pinger -n kube-system
-kubectl rollout status deployment/coredns -n kube-system
+sleep 5
+kubectl rollout status daemonset/kube-ovn-pinger -n kube-system --timeout 300s
+kubectl rollout status deployment/coredns -n kube-system --timeout 300s
 echo "-------------------------------"
 echo ""
 
@@ -2435,13 +2721,20 @@ cat <<\EOF > /usr/local/bin/kubectl-ko
 set -euo pipefail
 
 KUBE_OVN_NS=kube-system
+EOF
+cat <<EOF >> /usr/local/bin/kubectl-ko
+WITHOUT_KUBE_PROXY=${WITHOUT_KUBE_PROXY}
+EOF
+cat <<\EOF >> /usr/local/bin/kubectl-ko
 OVN_NB_POD=
 OVN_SB_POD=
+KUBE_OVN_VERSION=
+REGISTRY="kubeovn"
 
 showHelp(){
   echo "kubectl ko {subcommand} [option...]"
   echo "Available Subcommands:"
-  echo "  [nb|sb] [status|kick|backup]     ovn-db operations show cluster status, kick stale server or backup database"
+  echo "  [nb|sb] [status|kick|backup|dbstatus|restore]     ovn-db operations show cluster status, kick stale server, backup database, get db consistency status or restore ovn nb db when met 'inconsistent data' error"
   echo "  nbctl [ovn-nbctl options ...]    invoke ovn-nbctl"
   echo "  sbctl [ovn-sbctl options ...]    invoke ovn-sbctl"
   echo "  vsctl {nodeName} [ovs-vsctl options ...]   invoke ovs-vsctl on the specified node"
@@ -2451,6 +2744,7 @@ showHelp(){
   echo "  tcpdump {namespace/podname} [tcpdump options ...]     capture pod traffic"
   echo "  trace {namespace/podname} {target ip address} {icmp|tcp|udp} [target tcp or udp port]    trace ovn microflow of specific packet"
   echo "  diagnose {all|node} [nodename]    diagnose connectivity of all nodes or a specific node"
+  echo "  tuning {install-fastpath|local-install-fastpath|remove-fastpath|install-stt|local-install-stt|remove-stt} {centos7|centos8}} [kernel-devel-version]  deploy  kernel optimisation components to the system"
   echo "  reload restart all kube-ovn components"
 }
 
@@ -2519,21 +2813,29 @@ trace(){
     proto="6"
   fi
 
-  podIPs=($(kubectl get pod "$podName" -n "$namespace" -o jsonpath="{.status.podIPs[*].ip}"))
-  mac=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/mac_address})
-  ls=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/logical_switch})
   hostNetwork=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.spec.hostNetwork})
-  nodeName=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.spec.nodeName})
-
   if [ "$hostNetwork" = "true" ]; then
     echo "Can not trace host network pod"
     exit 1
   fi
 
+  ls=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/logical_switch})
   if [ -z "$ls" ]; then
     echo "pod address not ready"
     exit 1
   fi
+
+  podIPs=($(kubectl get pod "$podName" -n "$namespace" -o jsonpath="{.status.podIPs[*].ip}"))
+  if [ ${#podIPs[@]} -eq 0 ]; then
+    podIPs=($(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/ip_address} | sed 's/,/ /g'))
+    if [ ${#podIPs[@]} -eq 0 ]; then
+      echo "pod address not ready"
+      exit 1
+    fi
+  fi
+
+  mac=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/mac_address})
+  nodeName=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.spec.nodeName})
 
   podIP=""
   for ip in ${podIPs[@]}; do
@@ -2692,7 +2994,11 @@ diagnose(){
   kubectl get crd ips.kubeovn.io
   kubectl get crd vlans.kubeovn.io
   kubectl get crd provider-networks.kubeovn.io
-  kubectl get svc kube-dns -n kube-system
+  set +eu
+  if ! kubectl get svc kube-dns -n kube-system ; then
+     echo "Warning: kube-dns doesn't exist, maybe there is coredns service."
+  fi
+  set -eu
   kubectl get svc kubernetes -n default
   kubectl get sa -n kube-system ovn
   kubectl get clusterrole system:ovn
@@ -2707,7 +3013,10 @@ diagnose(){
   kubectl ko nbctl list acl
   kubectl ko sbctl show
 
-  checkKubeProxy
+  if [ "${WITHOUT_KUBE_PROXY}" = "false" ]; then
+    checkKubeProxy
+  fi
+
   checkDeployment ovn-central
   checkDeployment kube-ovn-controller
   checkDaemonSet kube-ovn-cni
@@ -2785,6 +3094,12 @@ getOvnCentralPod(){
       exit 1
     fi
     OVN_SB_POD=$SB_POD
+    VERSION=$(kubectl  -n kube-system get pods -l ovn-sb-leader=true -o yaml | grep  "image: $REGISTRY/kube-ovn:" | head -n 1 | awk -F ':' '{print $3}')
+    if [ -z "$VERSION" ]; then
+          echo "kubeovn version not exists"
+          exit 1
+        fi
+    KUBE_OVN_VERSION=$VERSION
 }
 
 checkDaemonSet(){
@@ -2816,8 +3131,9 @@ checkDeployment(){
 }
 
 checkKubeProxy(){
-  dsMode=`kubectl get ds -n kube-system | grep kube-proxy || true`
-  if [ -z "$dsMode" ]; then
+  if kubectl get ds -n kube-system --no-headers -o custom-columns=NAME:.metadata.name | grep -qw ^kube-proxy; then
+    checkDaemonSet kube-proxy
+  else
     nodeIps=`kubectl get node -o wide | grep -v "INTERNAL-IP" | awk '{print $6}'`
     for node in $nodeIps
     do
@@ -2827,8 +3143,6 @@ checkKubeProxy(){
         exit 1
       fi
     done
-  else
-    checkDaemonSet kube-proxy
   fi
   echo "kube-proxy ready"
 }
@@ -2851,7 +3165,63 @@ dbtool(){
           kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovsdb-tool cluster-to-standalone /etc/ovn/ovnnb_db.$suffix.backup /etc/ovn/ovnnb_db.db
           kubectl cp $KUBE_OVN_NS/$OVN_NB_POD:/etc/ovn/ovnnb_db.$suffix.backup $(pwd)/ovnnb_db.$suffix.backup
           kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- rm -f /etc/ovn/ovnnb_db.$suffix.backup
-          echo "backup $component to $(pwd)/ovnnb_db.$suffix.backup"
+          echo "backup ovn-$component db to $(pwd)/ovnnb_db.$suffix.backup"
+          ;;
+        dbstatus)
+          kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovn-appctl -t /var/run/ovn/ovnnb_db.ctl ovsdb-server/get-db-storage-status OVN_Northbound
+          ;;
+        restore)
+          # set ovn-central replicas to 0
+          replicas=$(kubectl get deployment -n $KUBE_OVN_NS ovn-central -o jsonpath={.spec.replicas})
+          kubectl scale deployment -n $KUBE_OVN_NS ovn-central --replicas=0
+          echo "ovn-central original replicas is $replicas"
+
+          # backup ovn-nb db
+          declare nodeIpArray
+          declare podNameArray
+          declare nodeIps
+
+          if [[ $(kubectl get deployment -n kube-system ovn-central -o jsonpath='{.spec.template.spec.containers[0].env[1]}') =~ "NODE_IPS" ]]; then
+            nodeIpVals=`kubectl get deployment -n kube-system ovn-central -o jsonpath='{.spec.template.spec.containers[0].env[1].value}'`
+            nodeIps=(${nodeIpVals//,/ })
+          else
+            nodeIps=`kubectl get node -lkube-ovn/role=master -o wide | grep -v "INTERNAL-IP" | awk '{print $6}'`
+          fi
+          firstIP=${nodeIps[0]}
+          podNames=`kubectl get pod -n $KUBE_OVN_NS | grep ovs-ovn | awk '{print $1}'`
+          echo "first nodeIP is $firstIP"
+
+          i=0
+          for nodeIp in ${nodeIps[@]}
+          do
+            for pod in $podNames
+            do
+              hostip=$(kubectl get pod -n $KUBE_OVN_NS $pod -o jsonpath={.status.hostIP})
+              if [ $nodeIp = $hostip ]; then
+                nodeIpArray[$i]=$nodeIp
+                podNameArray[$i]=$pod
+                i=`expr $i + 1`
+                echo "ovs-ovn pod on node $nodeIp is $pod"
+                break
+              fi
+            done
+          done
+
+          echo "backup nb db file"
+          kubectl exec -it -n $KUBE_OVN_NS ${podNameArray[0]} -- ovsdb-tool cluster-to-standalone  /etc/ovn/ovnnb_db_standalone.db  /etc/ovn/ovnnb_db.db
+
+          # mv all db files
+          for pod in ${podNameArray[@]}
+          do
+            kubectl exec -it -n $KUBE_OVN_NS $pod -- mv /etc/ovn/ovnnb_db.db /tmp
+            kubectl exec -it -n $KUBE_OVN_NS $pod -- mv /etc/ovn/ovnsb_db.db /tmp
+          done
+
+          # restore db and replicas
+          echo "restore nb db file, operate in pod ${podNameArray[0]}"
+          kubectl exec -it -n $KUBE_OVN_NS ${podNameArray[0]} -- mv /etc/ovn/ovnnb_db_standalone.db /etc/ovn/ovnnb_db.db
+          kubectl scale deployment -n $KUBE_OVN_NS ovn-central --replicas=$replicas
+          echo "finish restore nb db file and ovn-central replicas"
           ;;
         *)
           echo "unknown action $action"
@@ -2870,7 +3240,13 @@ dbtool(){
           kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovsdb-tool cluster-to-standalone /etc/ovn/ovnsb_db.$suffix.backup /etc/ovn/ovnsb_db.db
           kubectl cp $KUBE_OVN_NS/$OVN_SB_POD:/etc/ovn/ovnsb_db.$suffix.backup $(pwd)/ovnsb_db.$suffix.backup
           kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- rm -f /etc/ovn/ovnsb_db.$suffix.backup
-          echo "backup $component to $(pwd)/ovnsb_db.$suffix.backup"
+          echo "backup ovn-$component db to $(pwd)/ovnsb_db.$suffix.backup"
+          ;;
+        dbstatus)
+          kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovn-appctl -t /var/run/ovn/ovnsb_db.ctl ovsdb-server/get-db-storage-status OVN_Southbound
+          ;;
+        restore)
+          echo "restore cmd is only used for nb db"
           ;;
         *)
           echo "unknown action $action"
@@ -2878,6 +3254,141 @@ dbtool(){
       ;;
     *)
       echo "unknown subcommand $component"
+  esac
+}
+
+tuning(){
+  action="$1"; shift
+  sys="$1"; shift
+  case $action in
+    install-fastpath)
+      case $sys in
+        centos7)
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp/:/tmp/ $REGISTRY/centos7-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh  centos install"
+          while [ ! -f /tmp/kube_ovn_fastpath.ko ];
+          do
+            sleep 1
+          done
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            kubectl cp /tmp/kube_ovn_fastpath.ko kube-system/"$i":/tmp/
+          done
+          ;;
+        centos8)
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp/:/tmp/ $REGISTRY/centos8-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh  centos install"
+          while [ ! -f /tmp/kube_ovn_fastpath.ko ];
+          do
+            sleep 1
+          done
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            kubectl cp /tmp/kube_ovn_fastpath.ko kube-system/"$i":/tmp/
+          done
+          ;;
+        *)
+          echo "unknown system $sys"
+      esac
+      ;;
+    local-install-fastpath)
+      case $sys in
+        centos7)
+          # shellcheck disable=SC2145
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp:/tmp $REGISTRY/centos7-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh centos local-install $@"
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            kubectl cp /tmp/kube_ovn_fastpath.ko kube-system/"$i":/tmp/
+          done
+          ;;
+        centos8)
+          # shellcheck disable=SC2145
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp:/tmp $REGISTRY/centos8-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh centos local-install $@"
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            kubectl cp /tmp/kube_ovn_fastpath.ko kube-system/"$i":/tmp/
+          done
+          ;;
+        *)
+          echo "unknown system $sys"
+      esac
+      ;;
+    remove-fastpath)
+      case $sys in
+        centos)
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            kubectl -n kube-system exec "$i" -- rm -f /tmp/kube_ovn_fastpath.ko
+          done
+          ;;
+        *)
+          echo "unknown system $sys"
+      esac
+      ;;
+    install-stt)
+      case $sys in
+        centos7)
+          # shellcheck disable=SC2145
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp:/tmp $REGISTRY/centos7-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh stt install"
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            for k in /tmp/*.rpm; do
+              kubectl cp "$k" kube-system/"$i":/tmp/
+            done
+          done
+          ;;
+        centos8)
+          # shellcheck disable=SC2145
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp:/tmp $REGISTRY/centos8-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh stt install"
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            for k in /tmp/*.rpm; do
+              kubectl cp "$k" kube-system/"$i":/tmp/
+            done
+          done
+          ;;
+        *)
+          echo "unknown system $sys"
+      esac
+      ;;
+    local-install-stt)
+      case $sys in
+        centos7)
+          # shellcheck disable=SC2145
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp:/tmp $REGISTRY/centos7-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh stt local-install $@"
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            for k in /tmp/*.rpm; do
+              kubectl cp "$k" kube-system/"$i":/tmp/
+            done
+          done
+          ;;
+        centos8)
+          # shellcheck disable=SC2145
+          docker run -it --privileged -v /lib/modules:/lib/modules -v /usr/src:/usr/src -v /tmp:/tmp $REGISTRY/centos8-compile:"$KUBE_OVN_VERSION" bash -c "./module.sh stt local-install $@"
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            for k in /tmp/*.rpm; do
+              kubectl cp "$k" kube-system/"$i":/tmp/
+            done
+          done
+          ;;
+        *)
+          echo "unknown system $sys"
+      esac
+      ;;
+    remove-stt)
+      case $sys in
+        centos)
+          for i in $(kubectl -n kube-system get pods | grep ovn-cni | awk '{print $1}');
+          do
+            kubectl -n kube-system exec "$i" -- rm -f /tmp/openvswitch-kmod*.rpm
+          done
+          ;;
+        *)
+          echo "unknown system $sys"
+      esac
+      ;;
+    *)
+      echo "unknown action $action"
   esac
 }
 
@@ -2929,11 +3440,13 @@ case $subcommand in
   reload)
     reload
     ;;
+  tuning)
+    tuning "$@"
+    ;;
   *)
-    showHelp
+  showHelp
     ;;
 esac
-
 EOF
 
 chmod +x /usr/local/bin/kubectl-ko
@@ -2949,7 +3462,6 @@ fi
 
 echo "[Step 6/6] Run network diagnose"
 kubectl ko diagnose all
-
 
 echo "-------------------------------"
 echo "

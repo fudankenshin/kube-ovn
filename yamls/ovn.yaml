@@ -64,6 +64,7 @@ rules:
       - vpc-nat-gateways
       - ips
       - vlans
+      - vlans/status
       - provider-networks
       - provider-networks/status
       - networks
@@ -109,6 +110,7 @@ rules:
       - statefulsets
       - daemonsets
       - deployments
+      - deployments/scale
     verbs:
       - create
       - delete
@@ -125,6 +127,24 @@ rules:
       - create
       - patch
       - update
+  - apiGroups:
+      - "k8s.cni.cncf.io"
+    resources:
+      - network-attachment-definitions
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - update
+  - apiGroups:
+      - "kubevirt.io"
+    resources:
+      - virtualmachines
+      - virtualmachineinstances
+    verbs:
+      - get
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -216,7 +236,12 @@ spec:
         type: infra
     spec:
       tolerations:
-        - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -229,7 +254,7 @@ spec:
       hostNetwork: true
       containers:
         - name: ovn-central
-          image: "kubeovn/kube-ovn:v1.8.0"
+          image: "kubeovn/kube-ovn:v1.9.0"
           imagePullPolicy: IfNotPresent
           command: ["/kube-ovn/start-db.sh"]
           securityContext:
@@ -258,7 +283,7 @@ spec:
               memory: 200Mi
             limits:
               cpu: 3
-              memory: 3Gi
+              memory: 4Gi
           volumeMounts:
             - mountPath: /var/run/openvswitch
               name: host-run-ovs
@@ -283,8 +308,8 @@ spec:
             exec:
               command:
                 - bash
-                - /kube-ovn/ovn-is-leader.sh
-            periodSeconds: 3
+                - /kube-ovn/ovn-healthcheck.sh
+            periodSeconds: 15
             timeoutSeconds: 45
           livenessProbe:
             exec:
@@ -292,7 +317,7 @@ spec:
                 - bash
                 - /kube-ovn/ovn-healthcheck.sh
             initialDelaySeconds: 30
-            periodSeconds: 7
+            periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 45
       nodeSelector:
@@ -350,14 +375,19 @@ spec:
         type: infra
     spec:
       tolerations:
-        - operator: Exists
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
       hostPID: true
       containers:
         - name: openvswitch
-          image: "kubeovn/kube-ovn:v1.8.0"
+          image: "kubeovn/kube-ovn:v1.9.0"
           imagePullPolicy: IfNotPresent
           command: ["/kube-ovn/start-ovs.sh"]
           securityContext:

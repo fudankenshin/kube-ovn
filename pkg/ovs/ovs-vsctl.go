@@ -7,8 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/klog/v2"
+
 	"github.com/kubeovn/kube-ovn/pkg/util"
-	"k8s.io/klog"
 )
 
 // Glory belongs to openvswitch/ovn-kubernetes
@@ -105,30 +106,76 @@ func ovsGet(table, record, column, key string) (string, error) {
 	return Exec(args...)
 }
 
+func ovsRemove(table, record, column, key string) error {
+	args := []string{"remove"}
+	if key == "" {
+		args = append(args, table, record, column)
+	} else {
+		args = append(args, table, record, column, key)
+	}
+	_, err := Exec(args...)
+	return err
+}
+
 // Bridges returns bridges created by Kube-OVN
 func Bridges() ([]string, error) {
 	return ovsFind("bridge", "name", fmt.Sprintf("external-ids:vendor=%s", util.CniTypeName))
 }
 
-// ClearPodBandwidth remove qos related to this pod.
-func ClearPodBandwidth(podName, podNamespace, ifaceID string) error {
-	var qosList, qosListByPod []string
+// BridgeExists checks whether the bridge already exists
+func BridgeExists(name string) (bool, error) {
+	bridges, err := Bridges()
+	if err != nil {
+		return false, err
+	}
+	return util.ContainsString(bridges, name), nil
+}
+
+func GetQosList(podName, podNamespace, ifaceID string) ([]string, error) {
+	var qosList []string
 	var err error
+
 	if ifaceID != "" {
 		qosList, err = ovsFind("qos", "_uuid", fmt.Sprintf(`external-ids:iface-id="%s"`, ifaceID))
 		if err != nil {
-			return err
+			return qosList, err
 		}
 	} else {
-		qosListByPod, err = ovsFind("qos", "_uuid", fmt.Sprintf(`external-ids:pod="%s/%s"`, podNamespace, podName))
+		qosList, err = ovsFind("qos", "_uuid", fmt.Sprintf(`external-ids:pod="%s/%s"`, podNamespace, podName))
 		if err != nil {
-			return err
+			return qosList, err
 		}
 	}
-	qosList = append(qosList, qosListByPod...)
-	qosList = util.UniqString(qosList)
-	for _, qos := range qosList {
-		if err := ovsDestroy("qos", qos); err != nil {
+
+	return qosList, nil
+}
+
+// ClearPodBandwidth remove qos related to this pod.
+func ClearPodBandwidth(podName, podNamespace, ifaceID string) error {
+	qosList, err := GetQosList(podName, podNamespace, ifaceID)
+	if err != nil {
+		return err
+	}
+
+	// https://github.com/kubeovn/kube-ovn/issues/1191
+	usedQosList, err := ovsFind("port", "qos", "qos!=[]")
+	if err != nil {
+		return err
+	}
+
+	for _, qosId := range qosList {
+		found := false
+		for _, usedQosId := range usedQosList {
+			if qosId == usedQosId {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		if err := ovsDestroy("qos", qosId); err != nil {
 			return err
 		}
 	}
@@ -267,17 +314,17 @@ func ValidatePortVendor(port string) (bool, error) {
 	return util.ContainsString(output, port), err
 }
 
-//config mirror for interface by pod annotations and install param
+// config mirror for interface by pod annotations and install param
 func ConfigInterfaceMirror(globalMirror bool, open string, iface string) error {
 	if !globalMirror {
-		//find interface name for port
+		// find interface name for port
 		interfaceList, err := ovsFind("interface", "name", fmt.Sprintf("external-ids:iface-id=%s", iface))
 		if err != nil {
 			return err
 		}
 		for _, ifName := range interfaceList {
-			//ifName example: xxx_h
-			//find port uuid by interface name
+			// ifName example: xxx_h
+			// find port uuid by interface name
 			portUUIDs, err := ovsFind("port", "_uuid", fmt.Sprintf("name=%s", ifName))
 			if err != nil {
 				return err
@@ -287,7 +334,7 @@ func ConfigInterfaceMirror(globalMirror bool, open string, iface string) error {
 			}
 			portId := portUUIDs[0]
 			if open == "true" {
-				//add port to mirror
+				// add port to mirror
 				err = ovsAdd("mirror", util.MirrorDefaultName, "select_dst_port", portId)
 				if err != nil {
 					return err
@@ -305,7 +352,7 @@ func ConfigInterfaceMirror(globalMirror bool, open string, iface string) error {
 				}
 				for _, mirrorPortIds := range mirrorPorts {
 					if strings.Contains(mirrorPortIds, portId) {
-						//remove port from mirror
+						// remove port from mirror
 						_, err := Exec("remove", "mirror", util.MirrorDefaultName, "select_dst_port", portId)
 						if err != nil {
 							return err
@@ -356,7 +403,24 @@ func ClearHtbQosQueue(podName, podNamespace, iface string) error {
 		}
 	}
 
+	// https://github.com/kubeovn/kube-ovn/issues/1191
+	qosQueueMap, err := ListQosQueueIds()
+	if err != nil {
+		return err
+	}
+
 	for _, queueId := range queueList {
+		found := false
+		for _, usedQueueId := range qosQueueMap {
+			if queueId == usedQueueId {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
 		if err := ovsDestroy("queue", queueId); err != nil {
 			return err
 		}
@@ -539,7 +603,7 @@ func SetNetemQos(podName, podNamespace, iface, latency, limit, loss string) erro
 	}
 
 	for _, ifName := range interfaceList {
-		qosList, err := ovsFind("qos", "_uuid", fmt.Sprintf("external-ids:iface-id=%s", iface))
+		qosList, err := GetQosList(podName, podNamespace, iface)
 		if err != nil {
 			return err
 		}
@@ -582,6 +646,22 @@ func SetNetemQos(podName, podNamespace, iface, latency, limit, loss string) erro
 
 					if err := ovsSet("qos", qos, qosCommandValues...); err != nil {
 						return err
+					}
+
+					if latencyMs == 0 {
+						if err := ovsRemove("qos", qos, "other_config", "latency"); err != nil {
+							return err
+						}
+					}
+					if limitPkts == 0 {
+						if err := ovsRemove("qos", qos, "other_config", "limit"); err != nil {
+							return err
+						}
+					}
+					if lossPercent == 0 {
+						if err := ovsRemove("qos", qos, "other_config", "loss"); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -637,4 +717,39 @@ func ListExternalIds(table string) (map[string]string, error) {
 		}
 	}
 	return result, nil
+}
+
+func ListQosQueueIds() (map[string]string, error) {
+	args := []string{"--data=bare", "--format=csv", "--no-heading", "--columns=_uuid,queues", "find", "qos", "queues:0!=[]"}
+	output, err := Exec(args...)
+	if err != nil {
+		klog.Errorf("failed to list qos, %v", err)
+		return nil, err
+	}
+	lines := strings.Split(output, "\n")
+	result := make(map[string]string, len(lines))
+	for _, l := range lines {
+		if len(strings.TrimSpace(l)) == 0 {
+			continue
+		}
+		parts := strings.Split(strings.TrimSpace(l), ",")
+		if len(parts) != 2 {
+			continue
+		}
+		qosId := strings.TrimSpace(parts[0])
+		if !strings.Contains(strings.TrimSpace(parts[1]), "0=") {
+			continue
+		}
+		queueId := strings.TrimPrefix(strings.TrimSpace(parts[1]), "0=")
+		result[qosId] = queueId
+	}
+	return result, nil
+}
+
+func IsUserspaceDataPath() (is bool, err error) {
+	dp, err := ovsFind("bridge", "datapath_type", "name=br-int")
+	if err != nil {
+		return false, err
+	}
+	return len(dp) > 0 && dp[0] == "netdev", nil
 }

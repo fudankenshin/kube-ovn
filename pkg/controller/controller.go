@@ -19,7 +19,7 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	kubeovninformer "github.com/kubeovn/kube-ovn/pkg/client/informers/externalversions"
@@ -72,6 +72,7 @@ type Controller struct {
 	deleteSubnetQueue       workqueue.RateLimitingInterface
 	deleteRouteQueue        workqueue.RateLimitingInterface
 	updateSubnetStatusQueue workqueue.RateLimitingInterface
+	syncVirtualPortsQueue   workqueue.RateLimitingInterface
 
 	ipsLister kubeovnlister.IPLister
 	ipSynced  cache.InformerSynced
@@ -195,6 +196,7 @@ func NewController(config *Configuration) *Controller {
 		deleteSubnetQueue:       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DeleteSubnet"),
 		deleteRouteQueue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DeleteRoute"),
 		updateSubnetStatusQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdateSubnetStatus"),
+		syncVirtualPortsQueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "SyncVirtualPort"),
 
 		ipsLister: ipInformer.Lister(),
 		ipSynced:  ipInformer.Informer().HasSynced,
@@ -272,6 +274,7 @@ func NewController(config *Configuration) *Controller {
 	})
 
 	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    controller.enqueueAddService,
 		DeleteFunc: controller.enqueueDeleteService,
 		UpdateFunc: controller.enqueueUpdateService,
 	})
@@ -404,6 +407,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	if err := c.initSyncCrdVlans(); err != nil {
 		klog.Errorf("failed to sync crd vlans: %v", err)
 	}
+	if err := c.initDeleteOverlayPodsStaticRoutes(); err != nil {
+		klog.Errorf("failed to delete pod's static route in default vpc: %v", err)
+	}
+	// The static route for node gw can be deleted when gc static route, so add it after gc process
+	dstIp := "0.0.0.0/0,::/0"
+	if err := c.ovnClient.AddStaticRoute("", dstIp, c.config.NodeSwitchGateway, c.config.ClusterRouter, util.NormalRouteType); err != nil {
+		klog.Errorf("failed to add static route for node gw: %v", err)
+	}
 
 	// start workers to do all the network operations
 	c.startWorkers(stopCh)
@@ -425,6 +436,7 @@ func (c *Controller) shutdown() {
 	c.deleteSubnetQueue.ShutDown()
 	c.deleteRouteQueue.ShutDown()
 	c.updateSubnetStatusQueue.ShutDown()
+	c.syncVirtualPortsQueue.ShutDown()
 
 	c.addNodeQueue.ShutDown()
 	c.updateNodeQueue.ShutDown()
@@ -540,6 +552,7 @@ func (c *Controller) startWorkers(stopCh <-chan struct{}) {
 		go wait.Until(c.runDeleteSubnetWorker, time.Second, stopCh)
 		go wait.Until(c.runDeleteRouteWorker, time.Second, stopCh)
 		go wait.Until(c.runUpdateSubnetStatusWorker, time.Second, stopCh)
+		go wait.Until(c.runSyncVirtualPortsWorker, time.Second, stopCh)
 
 		if c.config.EnableLb {
 			go wait.Until(c.runUpdateServiceWorker, time.Second, stopCh)
@@ -585,10 +598,13 @@ func (c *Controller) startWorkers(stopCh <-chan struct{}) {
 		}, 5*time.Second, stopCh)
 	}
 
+	go wait.Until(c.resyncProviderNetworkStatus, 30*time.Second, stopCh)
 	go wait.Until(c.resyncSubnetMetrics, 30*time.Second, stopCh)
 	go wait.Until(c.CheckGatewayReady, 5*time.Second, stopCh)
 
 	if c.config.EnableNP {
 		go wait.Until(c.CheckNodePortGroup, 10*time.Second, stopCh)
 	}
+
+	go wait.Until(c.syncVmLiveMigrationPort, 15*time.Second, stopCh)
 }

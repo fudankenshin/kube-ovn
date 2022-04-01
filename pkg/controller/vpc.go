@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
@@ -60,6 +60,8 @@ func (c *Controller) enqueueUpdateVpc(old, new interface{}) {
 	if !newVpc.DeletionTimestamp.IsZero() ||
 		!reflect.DeepEqual(oldVpc.Spec.Namespaces, newVpc.Spec.Namespaces) ||
 		!reflect.DeepEqual(oldVpc.Spec.StaticRoutes, newVpc.Spec.StaticRoutes) ||
+		!reflect.DeepEqual(oldVpc.Spec.PolicyRoutes, newVpc.Spec.PolicyRoutes) ||
+		!reflect.DeepEqual(oldVpc.Spec.VpcPeerings, newVpc.Spec.VpcPeerings) ||
 		!reflect.DeepEqual(oldVpc.Annotations, newVpc.Annotations) {
 		klog.V(3).Infof("enqueue update vpc %s", key)
 		c.addOrUpdateVpcQueue.Add(key)
@@ -112,13 +114,14 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
 }
 
 func (c *Controller) handleUpdateVpcStatus(key string) error {
-	vpc, err := c.vpcsLister.Get(key)
+	orivpc, err := c.vpcsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	vpc := orivpc.DeepCopy()
 
 	subnets, defaultSubnet, err := c.getVpcSubnets(vpc)
 	if err != nil {
@@ -251,13 +254,14 @@ func (c *Controller) addLoadBalancer(vpc string) (*VpcLoadBalancer, error) {
 }
 
 func (c *Controller) handleAddOrUpdateVpc(key string) error {
-	vpc, err := c.vpcsLister.Get(key)
+	orivpc, err := c.vpcsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	vpc := orivpc.DeepCopy()
 
 	if err = formatVpc(vpc, c); err != nil {
 		klog.Errorf("failed to format vpc: %v", err)
@@ -265,6 +269,27 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	}
 	if err = c.createVpcRouter(key); err != nil {
 		return err
+	}
+
+	var newPeers []string
+	for _, peering := range vpc.Spec.VpcPeerings {
+		if err = util.CheckCidrs(peering.LocalConnectIP); err != nil {
+			klog.Errorf("invalid cidr %s", peering.LocalConnectIP)
+			return err
+		}
+		newPeers = append(newPeers, peering.RemoteVpc)
+		if err := c.ovnClient.CreatePeerRouterPort(vpc.Name, peering.RemoteVpc, peering.LocalConnectIP); err != nil {
+			klog.Errorf("failed to create peer router port for vpc %s, %v", vpc.Name, err)
+			return err
+		}
+	}
+	for _, oldPeer := range vpc.Status.VpcPeerings {
+		if !util.ContainsString(newPeers, oldPeer) {
+			if err = c.ovnClient.DeleteLogicalRouterPort(fmt.Sprintf("%s-%s", vpc.Name, oldPeer)); err != nil {
+				klog.Errorf("failed to delete peer router port for vpc %s, %v", vpc.Name, err)
+				return err
+			}
+		}
 	}
 
 	if vpc.Name != util.DefaultVpc {
@@ -321,6 +346,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 
 	vpc.Status.Router = key
 	vpc.Status.Standby = true
+	vpc.Status.VpcPeerings = newPeers
 	if c.config.EnableLb {
 		vpcLb, err := c.addLoadBalancer(key)
 		if err != nil {

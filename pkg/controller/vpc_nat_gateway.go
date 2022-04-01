@@ -20,7 +20,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -33,14 +33,14 @@ var (
 )
 
 const (
-	NAT_GW_INIT             = "init"
-	NAT_GW_FLOATING_IP_SYNC = "floating-ip-sync"
-	NAT_GW_EIP_ADD          = "eip-add"
-	NAT_GW_EIP_DEL          = "eip-del"
-	NAT_GW_SNAT_SYNC        = "snat-sync"
-	NAT_GW_DNAT_SYNC        = "dnat-sync"
-	NAT_GW_SUBNET_ROUTE_ADD = "subnet-route-add"
-	NAT_GW_SUBNET_ROUTE_DEL = "subnet-route-del"
+	natGwInit           = "init"
+	natGwFloatingIpSync = "floating-ip-sync"
+	natGwEipAdd         = "eip-add"
+	natGwEipDel         = "eip-del"
+	natGwSnatSync       = "snat-sync"
+	natGwDnatSync       = "dnat-sync"
+	natGwSubnetRouteAdd = "subnet-route-add"
+	natGwSubnetRouteDel = "subnet-route-del"
 )
 
 func genNatGwDpName(name string) string {
@@ -246,7 +246,7 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 
 	// check or create deployment
 	needToCreate := false
-	_, err = c.config.KubeClient.AppsV1().Deployments(c.config.PodNamespace).
+	oldDp, err := c.config.KubeClient.AppsV1().Deployments(c.config.PodNamespace).
 		Get(context.Background(), genNatGwDpName(gw.Name), metav1.GetOptions{})
 
 	if err != nil {
@@ -257,7 +257,7 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		}
 	}
 
-	newDp := c.genNatGwDeployment(gw)
+	newDp := c.genNatGwDeployment(gw, oldDp.DeepCopy())
 
 	if needToCreate {
 		_, err := c.config.KubeClient.AppsV1().Deployments(c.config.PodNamespace).
@@ -308,7 +308,6 @@ func (c *Controller) syncVpcNatGwRules(key string) error {
 	c.updateVpcFloatingIpQueue.Add(key)
 	c.updateVpcDnatQueue.Add(key)
 	c.updateVpcSnatQueue.Add(key)
-	c.updateVpcSnatQueue.Add(key)
 	c.updateVpcSubnetQueue.Add(key)
 	return nil
 }
@@ -319,21 +318,27 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	}
 	c.vpcNatGwKeyMutex.Lock(key)
 	defer c.vpcNatGwKeyMutex.Unlock(key)
-	_, err := c.vpcNatGatewayLister.Get(key)
+	gw, err := c.vpcNatGatewayLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
+	}
+	subnet, err := c.subnetsLister.Get(gw.Spec.Subnet)
+	if err != nil {
+		klog.Errorf("failed to get subnet %s: %v", gw.Spec.Subnet, err)
+		return fmt.Errorf("failed to initialize vpc nat gateway %s: %v", key, err)
 	}
 
-	pod, err := c.getNatGwPod(key)
+	oripod, err := c.getNatGwPod(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	pod := oripod.DeepCopy()
 
 	if pod.Status.Phase != corev1.PodRunning {
 		time.Sleep(5 * 1000)
@@ -343,7 +348,7 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
 		return nil
 	}
-	if err = c.execNatGwRules(pod, NAT_GW_INIT, nil); err != nil {
+	if err = c.execNatGwRules(pod, natGwInit, []string{subnet.Spec.CIDRBlock}); err != nil {
 		klog.Errorf("failed to init vpc nat gateway, err: %v", err)
 		return err
 	}
@@ -369,13 +374,14 @@ func (c *Controller) handleUpdateVpcEips(natGwKey string) error {
 		return err
 	}
 
-	pod, err := c.getNatGwPod(natGwKey)
+	oripod, err := c.getNatGwPod(natGwKey)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	pod := oripod.DeepCopy()
 
 	var toBeDelEips, oldEips []*kubeovnv1.Eip
 	if eipAnnotation, ok := pod.Annotations[util.VpcEipsAnnotation]; ok {
@@ -403,7 +409,7 @@ func (c *Controller) handleUpdateVpcEips(natGwKey string) error {
 		for _, rule := range toBeDelEips {
 			delRules = append(delRules, rule.EipCIDR)
 		}
-		if err = c.execNatGwRules(pod, NAT_GW_EIP_DEL, delRules); err != nil {
+		if err = c.execNatGwRules(pod, natGwEipDel, delRules); err != nil {
 			klog.Errorf("failed to exec nat gateway rule, err: %v", err)
 			return err
 		}
@@ -414,7 +420,7 @@ func (c *Controller) handleUpdateVpcEips(natGwKey string) error {
 		for _, rule := range gw.Spec.Eips {
 			addRules = append(addRules, fmt.Sprintf("%s,%s", rule.EipCIDR, rule.Gateway))
 		}
-		if err = c.execNatGwRules(pod, NAT_GW_EIP_ADD, addRules); err != nil {
+		if err = c.execNatGwRules(pod, natGwEipAdd, addRules); err != nil {
 			return err
 		}
 	}
@@ -446,13 +452,14 @@ func (c *Controller) handleUpdateVpcFloatingIp(natGwKey string) error {
 		return err
 	}
 
-	pod, err := c.getNatGwPod(natGwKey)
+	oripod, err := c.getNatGwPod(natGwKey)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	pod := oripod.DeepCopy()
 
 	// check md5
 	newMd5 := fmt.Sprintf("%x", structhash.Md5(gw.Spec.FloatingIpRules, 1))
@@ -466,7 +473,7 @@ func (c *Controller) handleUpdateVpcFloatingIp(natGwKey string) error {
 	for _, rule := range gw.Spec.FloatingIpRules {
 		rules = append(rules, fmt.Sprintf("%s,%s", rule.Eip, rule.InternalIp))
 	}
-	if err = c.execNatGwRules(pod, NAT_GW_FLOATING_IP_SYNC, rules); err != nil {
+	if err = c.execNatGwRules(pod, natGwFloatingIpSync, rules); err != nil {
 		klog.Errorf("failed to exec nat gateway rule, err: %v", err)
 		return err
 	}
@@ -495,13 +502,14 @@ func (c *Controller) handleUpdateVpcSnat(natGwKey string) error {
 		return err
 	}
 
-	pod, err := c.getNatGwPod(natGwKey)
+	oripod, err := c.getNatGwPod(natGwKey)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	pod := oripod.DeepCopy()
 
 	// check md5
 	newMd5 := fmt.Sprintf("%x", structhash.Md5(gw.Spec.SnatRules, 1))
@@ -515,7 +523,7 @@ func (c *Controller) handleUpdateVpcSnat(natGwKey string) error {
 	for _, rule := range gw.Spec.SnatRules {
 		rules = append(rules, fmt.Sprintf("%s,%s", rule.Eip, rule.InternalCIDR))
 	}
-	if err = c.execNatGwRules(pod, NAT_GW_SNAT_SYNC, rules); err != nil {
+	if err = c.execNatGwRules(pod, natGwSnatSync, rules); err != nil {
 		klog.Errorf("failed to exec nat gateway rule, err: %v", err)
 		return err
 	}
@@ -543,13 +551,14 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		return err
 	}
 
-	pod, err := c.getNatGwPod(natGwKey)
+	oripod, err := c.getNatGwPod(natGwKey)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	pod := oripod.DeepCopy()
 
 	// check md5
 	newMd5 := fmt.Sprintf("%x", structhash.Md5(gw.Spec.DnatRules, 1))
@@ -563,7 +572,7 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 	for _, rule := range gw.Spec.DnatRules {
 		rules = append(rules, fmt.Sprintf("%s,%s,%s,%s,%s", rule.Eip, rule.ExternalPort, rule.Protocol, rule.InternalIp, rule.InternalPort))
 	}
-	if err = c.execNatGwRules(pod, NAT_GW_DNAT_SYNC, rules); err != nil {
+	if err = c.execNatGwRules(pod, natGwDnatSync, rules); err != nil {
 		klog.Errorf("failed to exec nat gateway rule, err: %v", err)
 		return err
 	}
@@ -591,13 +600,14 @@ func (c *Controller) handleUpdateNatGwSubnetRoute(natGwKey string) error {
 		return err
 	}
 
-	pod, err := c.getNatGwPod(natGwKey)
+	oripod, err := c.getNatGwPod(natGwKey)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	pod := oripod.DeepCopy()
 
 	gwSubnet, err := c.subnetsLister.Get(gw.Spec.Subnet)
 	if err != nil {
@@ -636,9 +646,11 @@ func (c *Controller) handleUpdateNatGwSubnetRoute(natGwKey string) error {
 	if len(newCIDRS) > 0 {
 		var rules []string
 		for _, cidr := range newCIDRS {
-			rules = append(rules, fmt.Sprintf("%s,%s", cidr, gwSubnet.Spec.Gateway))
+			if !util.CIDRContainIP(cidr, gwSubnet.Spec.Gateway) {
+				rules = append(rules, fmt.Sprintf("%s,%s", cidr, gwSubnet.Spec.Gateway))
+			}
 		}
-		if err = c.execNatGwRules(pod, NAT_GW_SUBNET_ROUTE_ADD, rules); err != nil {
+		if err = c.execNatGwRules(pod, natGwSubnetRouteAdd, rules); err != nil {
 			klog.Errorf("failed to exec nat gateway rule, err: %v", err)
 			return err
 		}
@@ -646,7 +658,7 @@ func (c *Controller) handleUpdateNatGwSubnetRoute(natGwKey string) error {
 
 	if len(toBeDelCIDRs) > 0 {
 		for _, cidr := range toBeDelCIDRs {
-			if err = c.execNatGwRules(pod, NAT_GW_SUBNET_ROUTE_DEL, []string{cidr}); err != nil {
+			if err = c.execNatGwRules(pod, natGwSubnetRouteDel, []string{cidr}); err != nil {
 				klog.Errorf("failed to exec nat gateway rule, err: %v", err)
 				return err
 			}
@@ -692,7 +704,7 @@ func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []s
 	return nil
 }
 
-func (c *Controller) genNatGwDeployment(gw *kubeovnv1.VpcNatGateway) (dp *v1.Deployment) {
+func (c *Controller) genNatGwDeployment(gw *kubeovnv1.VpcNatGateway, oldDeploy *v1.Deployment) (dp *v1.Deployment) {
 	replicas := int32(1)
 	name := genNatGwDpName(gw.Name)
 	allowPrivilegeEscalation := true
@@ -701,6 +713,10 @@ func (c *Controller) genNatGwDeployment(gw *kubeovnv1.VpcNatGateway) (dp *v1.Dep
 		"app":                   name,
 		util.VpcNatGatewayLabel: "true",
 	}
+	newPodAnnotations := map[string]string{}
+	if oldDeploy != nil && len(oldDeploy.Annotations) != 0 {
+		newPodAnnotations = oldDeploy.Annotations
+	}
 
 	podAnnotations := map[string]string{
 		util.VpcNatGatewayAnnotation:     gw.Name,
@@ -708,6 +724,19 @@ func (c *Controller) genNatGwDeployment(gw *kubeovnv1.VpcNatGateway) (dp *v1.Dep
 		util.LogicalSwitchAnnotation:     gw.Spec.Subnet,
 		util.IpAddressAnnotation:         gw.Spec.LanIp,
 	}
+	for key, value := range podAnnotations {
+		newPodAnnotations[key] = value
+	}
+
+	selectors := make(map[string]string)
+	for _, v := range gw.Spec.Selector {
+		parts := strings.Split(strings.TrimSpace(v), ":")
+		if len(parts) != 2 {
+			continue
+		}
+		selectors[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+	klog.V(3).Infof("prepare for vpc nat gateway pod, node selector: %v", selectors)
 
 	dp = &v1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -721,7 +750,7 @@ func (c *Controller) genNatGwDeployment(gw *kubeovnv1.VpcNatGateway) (dp *v1.Dep
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      labels,
-					Annotations: podAnnotations,
+					Annotations: newPodAnnotations,
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -737,6 +766,7 @@ func (c *Controller) genNatGwDeployment(gw *kubeovnv1.VpcNatGateway) (dp *v1.Dep
 							},
 						},
 					},
+					NodeSelector: selectors,
 				},
 			},
 			Strategy: v1.DeploymentStrategy{

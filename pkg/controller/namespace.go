@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
@@ -71,6 +71,10 @@ func (c *Controller) enqueueUpdateNamespace(old, new interface{}) {
 		klog.Warningf("no logical switch annotation for ns %s", newNs.Name)
 		c.addNamespaceQueue.Add(newNs.Name)
 	}
+
+	if newNs.Annotations != nil && newNs.Annotations[util.LogicalSwitchAnnotation] != "" && !reflect.DeepEqual(oldNs.Annotations, newNs.Annotations) {
+		c.addNamespaceQueue.Add(newNs.Name)
+	}
 }
 
 func (c *Controller) runAddNamespaceWorker() {
@@ -111,16 +115,17 @@ func (c *Controller) processNextAddNamespaceWorkItem() bool {
 }
 
 func (c *Controller) handleAddNamespace(key string) error {
-	namespace, err := c.namespacesLister.Get(key)
+	orinamespace, err := c.namespacesLister.Get(key)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	namespace := orinamespace.DeepCopy()
 
-	var ls, cidr string
-	var excludeIps []string
+	var ls string
+	var lss, cidrs, excludeIps []string
 	subnets, err := c.subnetsLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list subnets %v", err)
@@ -130,18 +135,15 @@ func (c *Controller) handleAddNamespace(key string) error {
 	for _, s := range subnets {
 		for _, ns := range s.Spec.Namespaces {
 			if ns == key {
-				ls = s.Name
-				cidr = s.Spec.CIDRBlock
-				excludeIps = s.Spec.ExcludeIps
+				lss = append(lss, s.Name)
+				cidrs = append(cidrs, s.Spec.CIDRBlock)
+				excludeIps = append(excludeIps, strings.Join(s.Spec.ExcludeIps, ","))
 				break
 			}
 		}
-		if ls != "" {
-			break
-		}
 	}
 
-	if ls == "" {
+	if lss == nil {
 		// If NS does not belong to any custom VPC, then this NS belongs to the default VPC
 		vpc, err := c.vpcsLister.Get(c.config.ClusterRouter)
 		if err != nil {
@@ -170,10 +172,9 @@ func (c *Controller) handleAddNamespace(key string) error {
 			klog.Errorf("failed to get default subnet %v", err)
 			return err
 		}
-		ls = subnet.Name
-		cidr = subnet.Spec.CIDRBlock
-		excludeIps = subnet.Spec.ExcludeIps
-
+		lss = append(lss, subnet.Name)
+		cidrs = append(cidrs, subnet.Spec.CIDRBlock)
+		excludeIps = append(excludeIps, strings.Join(subnet.Spec.ExcludeIps, ","))
 	}
 
 	op := "replace"
@@ -181,16 +182,13 @@ func (c *Controller) handleAddNamespace(key string) error {
 		op = "add"
 		namespace.Annotations = map[string]string{}
 	} else {
-		if namespace.Annotations[util.LogicalSwitchAnnotation] == ls &&
-			namespace.Annotations[util.CidrAnnotation] == cidr &&
-			namespace.Annotations[util.ExcludeIpsAnnotation] == strings.Join(excludeIps, ",") {
+		if namespace.Annotations[util.LogicalSwitchAnnotation] == strings.Join(lss, ",") {
 			return nil
 		}
 	}
-
-	namespace.Annotations[util.LogicalSwitchAnnotation] = ls
-	namespace.Annotations[util.CidrAnnotation] = cidr
-	namespace.Annotations[util.ExcludeIpsAnnotation] = strings.Join(excludeIps, ",")
+	namespace.Annotations[util.LogicalSwitchAnnotation] = strings.Join(lss, ",")
+	namespace.Annotations[util.CidrAnnotation] = strings.Join(cidrs, ";")
+	namespace.Annotations[util.ExcludeIpsAnnotation] = strings.Join(excludeIps, ";")
 
 	if _, err = c.config.KubeClient.CoreV1().Namespaces().Patch(context.Background(), key, types.JSONPatchType, generatePatchPayload(namespace.Annotations, op), metav1.PatchOptions{}, ""); err != nil {
 		klog.Errorf("patch namespace %s failed %v", key, err)

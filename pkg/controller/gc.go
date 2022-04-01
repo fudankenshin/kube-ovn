@@ -11,8 +11,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
@@ -29,10 +30,41 @@ func (c *Controller) gc() error {
 		c.gcPortGroup,
 		c.gcStaticRoute,
 		c.gcVpcNatGateway,
+		c.gcLogicalRouterPort,
 	}
 	for _, gcFunc := range gcFunctions {
 		if err := gcFunc(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) gcLogicalRouterPort() error {
+	klog.Infof("start to gc logical router port")
+	vpcs, err := c.vpcsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list vpc, %v", err)
+		return err
+	}
+
+	var exceptPeerPorts []string
+	for _, vpc := range vpcs {
+		for _, peer := range vpc.Status.VpcPeerings {
+			exceptPeerPorts = append(exceptPeerPorts, fmt.Sprintf("%s-%s", vpc.Name, peer))
+		}
+	}
+	lrps, err := c.ovnClient.ListLogicalEntity("logical_router_port", "peer!=[]")
+	if err != nil {
+		klog.Errorf("failed to list logical router port, %v", err)
+		return err
+	}
+	for _, lrp := range lrps {
+		if !util.ContainsString(exceptPeerPorts, lrp) {
+			if err = c.ovnClient.DeleteLogicalRouterPort(lrp); err != nil {
+				klog.Errorf("failed to delete logical router port %s, %v", lrp, err)
+				return err
+			}
 		}
 	}
 	return nil
@@ -110,6 +142,27 @@ func (c *Controller) gcLogicalSwitch() error {
 				klog.Errorf("failed to gc subnet %s, %v", ls, err)
 				return err
 			}
+		}
+	}
+
+	klog.Infof("start to gc dhcp options")
+	dhcpOptions, err := c.ovnClient.ListDHCPOptions(c.config.EnableExternalVpc, "", "")
+	if err != nil {
+		klog.Errorf("failed to list dhcp options, %v", err)
+		return err
+	}
+	var uuidToDeleteList = []string{}
+	for _, item := range dhcpOptions {
+		ls := item.ExternalIds["ls"]
+		if !util.IsStringIn(ls, subnetNames) {
+			uuidToDeleteList = append(uuidToDeleteList, item.UUID)
+		}
+	}
+	klog.Infof("gc dhcp options %v", uuidToDeleteList)
+	if len(uuidToDeleteList) > 0 {
+		if err = c.ovnClient.DeleteDHCPOptionsByUUIDs(uuidToDeleteList); err != nil {
+			klog.Errorf("failed to delete dhcp options by uuids, %v", err)
+			return err
 		}
 	}
 	return nil
@@ -212,6 +265,7 @@ func (c *Controller) markAndCleanLSP() error {
 		} else if !isPodAlive(pod) {
 			continue
 		}
+		podName := c.getNameByPod(pod)
 
 		for k, v := range pod.Annotations {
 			if !strings.Contains(k, util.AllocatedAnnotationSuffix) || v != "true" {
@@ -225,7 +279,7 @@ func (c *Controller) markAndCleanLSP() error {
 			if !isProviderOvn {
 				continue
 			}
-			ipNames = append(ipNames, ovs.PodNameToPortName(pod.Name, pod.Namespace, providerName))
+			ipNames = append(ipNames, ovs.PodNameToPortName(podName, pod.Namespace, providerName))
 		}
 	}
 	for _, node := range nodes {
@@ -279,7 +333,8 @@ func (c *Controller) gcLoadBalancer() error {
 		if err != nil {
 			return err
 		}
-		for _, vpc := range vpcs {
+		for _, orivpc := range vpcs {
+			vpc := orivpc.DeepCopy()
 			for _, subnetName := range vpc.Status.Subnets {
 				_, err := c.subnetsLister.Get(subnetName)
 				if err != nil {
@@ -495,6 +550,21 @@ func (c *Controller) gcPortGroup() error {
 		for _, node := range nodes {
 			npNames = append(npNames, fmt.Sprintf("%s/%s", "node", node.Name))
 		}
+
+		// append overlay subnets port group to npNames to avoid gc distributed subnets port group
+		subnets, err := c.subnetsLister.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("failed to list subnets %v", err)
+			return err
+		}
+		for _, subnet := range subnets {
+			if subnet.Spec.Vpc != util.DefaultVpc || subnet.Spec.Vlan != "" || subnet.Name == c.config.NodeSwitch || subnet.Spec.GatewayType != kubeovnv1.GWDistributedType {
+				continue
+			}
+			for _, node := range nodes {
+				npNames = append(npNames, fmt.Sprintf("%s/%s", subnet.Name, node.Name))
+			}
+		}
 	}
 
 	pgs, err := c.ovnClient.ListNpPortGroup()
@@ -551,7 +621,7 @@ func (c *Controller) isOVNProvided(providerName string, pod *corev1.Pod) (bool, 
 		klog.Errorf("parse annotation logical switch %s error %v", ls, err)
 		return false, err
 	}
-	if subnet.Spec.Provider != "ovn" {
+	if !strings.HasSuffix(subnet.Spec.Provider, util.OvnProvider) {
 		return false, nil
 	}
 	return true, nil

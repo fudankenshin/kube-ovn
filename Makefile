@@ -1,4 +1,5 @@
-GO_VERSION = 1.16
+GO_VERSION = 1.17
+SHELL=/bin/bash
 
 REGISTRY = kubeovn
 DEV_TAG = dev
@@ -7,18 +8,27 @@ COMMIT = git-$(shell git rev-parse --short HEAD)
 DATE = $(shell date +"%Y-%m-%d_%H:%M:%S")
 GOLDFLAGS = "-w -s -extldflags '-z now' -X github.com/kubeovn/kube-ovn/versions.COMMIT=$(COMMIT) -X github.com/kubeovn/kube-ovn/versions.VERSION=$(RELEASE_TAG) -X github.com/kubeovn/kube-ovn/versions.BUILDDATE=$(DATE)"
 
+MULTUS_IMAGE = ghcr.io/k8snetworkplumbingwg/multus-cni:stable
+MULTUS_YAML = https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset.yml
+
+CILIUM_VERSION = 1.10.9
+CILIUM_IMAGE_REPO = quay.io/cilium/cilium
+
 # ARCH could be amd64,arm64
 ARCH = amd64
 
 .PHONY: build-go
 build-go:
 	go mod tidy
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -o $(CURDIR)/dist/images/kube-ovn -ldflags $(GOLDFLAGS) -v ./cmd/cni
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -o $(CURDIR)/dist/images/kube-ovn-cmd -ldflags $(GOLDFLAGS) -v ./cmd
+
+.PHONY: build-go-windows
+build-go-windows:
+	go mod tidy
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildmode=pie -o $(CURDIR)/dist/images/kube-ovn.exe -ldflags $(GOLDFLAGS) -v ./cmd/windows/cni
 
 .PHONY: build-go-arm
 build-go-arm:
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildmode=pie -o $(CURDIR)/dist/images/kube-ovn -ldflags $(GOLDFLAGS) -v ./cmd/cni
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildmode=pie -o $(CURDIR)/dist/images/kube-ovn-cmd -ldflags $(GOLDFLAGS) -v ./cmd
 
 .PHONY: build-bin
@@ -43,6 +53,10 @@ build-dpdk:
 base-amd64:
 	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64 -o type=docker -f dist/images/Dockerfile.base dist/images/
 
+.PHONY: base-amd64-dpdk
+base-amd64-dpdk:
+	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64-dpdk -o type=docker -f dist/images/Dockerfile.base-dpdk dist/images/
+
 .PHONY: base-arm64
 base-arm64:
 	docker buildx build --platform linux/arm64 --build-arg ARCH=arm64 -t $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-arm64 -o type=docker -f dist/images/Dockerfile.base dist/images/
@@ -50,7 +64,10 @@ base-arm64:
 .PHONY: release
 release: lint build-go
 	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk -o type=docker -f dist/images/Dockerfile.dpdk dist/images/
 	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/vpc-nat-gateway:$(RELEASE_TAG) -o type=docker -f dist/images/vpcnatgateway/Dockerfile dist/images/vpcnatgateway
+	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/centos7-compile:$(RELEASE_TAG) -o type=docker -f dist/images/compile/centos7/Dockerfile fastpath/
+#	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/centos8-compile:$(RELEASE_TAG) -o type=docker -f dist/images/compile/centos8/Dockerfile fastpath/
 
 .PHONY: release-arm
 release-arm: build-go-arm
@@ -69,64 +86,100 @@ push-release: release
 tar:
 	docker save $(REGISTRY)/kube-ovn:$(RELEASE_TAG) -o kube-ovn.tar
 	docker save $(REGISTRY)/vpc-nat-gateway:$(RELEASE_TAG) -o vpc-nat-gateway.tar
+	docker save $(REGISTRY)/centos7-compile:$(RELEASE_TAG) -o centos7-compile.tar
+#	docker save $(REGISTRY)/centos8-compile:$(RELEASE_TAG) -o centos8-compile.tar
 
 .PHONY: base-tar-amd64
 base-tar-amd64:
 	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64 -o image-amd64.tar
+
+.PHONY: base-tar-amd64-dpdk
+base-tar-amd64-dpdk:
+	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64-dpdk -o image-amd64-dpdk.tar
 
 .PHONY: base-tar-arm64
 base-tar-arm64:
 	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-arm64 -o image-arm64.tar
 
 .PHONY: kind-init
-kind-init:
-	kind delete cluster --name=kube-ovn
+kind-init: kind-clean
 	kube_proxy_mode=ipvs ip_family=ipv4 ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
 	kind create cluster --config yamls/kind.yaml --name kube-ovn
 	kubectl describe no
 
+.PHONY: kind-init-cluster
+kind-init-cluster: kind-clean-cluster
+	kube_proxy_mode=ipvs ip_family=ipv4 ha=false single=true j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
+	kind create cluster --config yamls/kind.yaml --name kube-ovn
+	kind create cluster --config yamls/kind.yaml --name kube-ovn1
+	kubectl config use-context kind-kube-ovn
+	kubectl get no
+	kubectl config use-context kind-kube-ovn1
+	kubectl get no
+
 .PHONY: kind-init-iptables
-kind-init-iptables:
-	kind delete cluster --name=kube-ovn
+kind-init-iptables: kind-clean
 	kube_proxy_mode=iptables ip_family=ipv4 ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
 	kind create cluster --config yamls/kind.yaml --name kube-ovn
 	kubectl describe no
 
 .PHONY: kind-init-ha
-kind-init-ha:
-	kind delete cluster --name=kube-ovn
+kind-init-ha: kind-clean
 	kube_proxy_mode=ipvs ip_family=ipv4 ha=true single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
 	kind create cluster --config yamls/kind.yaml --name kube-ovn
 	kubectl describe no
 
 .PHONY: kind-init-single
-kind-init-single:
-	kind delete cluster --name=kube-ovn
+kind-init-single: kind-clean
 	kube_proxy_mode=ipvs ip_family=ipv4 ha=false single=true j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
 	kind create cluster --config yamls/kind.yaml --name kube-ovn
 	kubectl describe no
 
 .PHONY: kind-init-ipv6
-kind-init-ipv6:
-	kind delete cluster --name=kube-ovn
-	kube_proxy_mode=iptables ip_family=ipv6 ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
+kind-init-ipv6: kind-clean
+	kube_proxy_mode=ipvs ip_family=ipv6 ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
 	kind create cluster --config yamls/kind.yaml --name kube-ovn
 	kubectl describe no
 
 .PHONY: kind-init-dual
-kind-init-dual:
-	kind delete cluster --name=kube-ovn
-	kube_proxy_mode=iptables ip_family=dual ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
+kind-init-dual: kind-clean
+	kube_proxy_mode=ipvs ip_family=dual ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
 	kind create cluster --config yamls/kind.yaml --name kube-ovn
 	kubectl describe no
 	docker exec kube-ovn-worker sysctl -w net.ipv6.conf.all.disable_ipv6=0
 	docker exec kube-ovn-control-plane sysctl -w net.ipv6.conf.all.disable_ipv6=0
 
+.PHONY: kind-init-cilium
+kind-init-cilium: kind-clean
+	kind delete cluster --name=kube-ovn
+	kube_proxy_mode=none ip_family=ipv4 ha=false single=false j2 yamls/kind.yaml.j2 -o yamls/kind.yaml
+	kind create cluster --config yamls/kind.yaml --name kube-ovn
+	kubectl describe no
+
 .PHONY: kind-install
 kind-install:
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
 	ENABLE_SSL=true dist/images/install.sh
+	kubectl describe no
+
+.PHONY: kind-install-cluster
+kind-install-cluster:
+	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
+	kind load docker-image --name kube-ovn1 $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
+	kubectl config use-context kind-kube-ovn
+	ENABLE_SSL=true dist/images/install.sh
+	kubectl describe no
+	kubectl config use-context kind-kube-ovn1
+	sed -e 's/10.16.0/10.18.0/g' \
+		-e 's/10.96.0/10.98.0/g' \
+		-e 's/100.64.0/100.68.0/g' \
+		dist/images/install.sh > install-multi.sh
+	ENABLE_SSL=true bash install-multi.sh
 	kubectl describe no
 
 .PHONY: kind-install-underlay
@@ -139,10 +192,13 @@ kind-install-underlay:
 		-e 's@^[[:space:]]*EXCLUDE_IPS=.*@EXCLUDE_IPS="$(EXCLUDE_IPS)"@' \
 		-e 's@^VLAN_ID=.*@VLAN_ID="0"@' \
 		dist/images/install.sh > install-underlay.sh
-	chmod +x install-underlay.sh
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
-	ENABLE_SSL=true ENABLE_VLAN=true VLAN_NIC=eth0 ./install-underlay.sh
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
+	ENABLE_SSL=true ENABLE_VLAN=true VLAN_NIC=eth0 bash install-underlay.sh
 	kubectl describe no
 
 .PHONY: kind-install-single
@@ -154,7 +210,11 @@ kind-install-single:
 .PHONY: kind-install-ipv6
 kind-install-ipv6:
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
 	ENABLE_SSL=true IPV6=true dist/images/install.sh
 
 .PHONY: kind-install-underlay-ipv6
@@ -167,15 +227,22 @@ kind-install-underlay-ipv6:
 		-e 's@^[[:space:]]*EXCLUDE_IPS=.*@EXCLUDE_IPS="$(EXCLUDE_IPS)"@' \
 		-e 's@^VLAN_ID=.*@VLAN_ID="0"@' \
 		dist/images/install.sh > install-underlay.sh
-	@chmod +x install-underlay.sh
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
-	ENABLE_SSL=true IPV6=true ENABLE_VLAN=true VLAN_NIC=eth0 ./install-underlay.sh
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
+	ENABLE_SSL=true IPV6=true ENABLE_VLAN=true VLAN_NIC=eth0 bash install-underlay.sh
 
 .PHONY: kind-install-dual
 kind-install-dual:
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
 	ENABLE_SSL=true DUAL_STACK=true dist/images/install.sh
 	kubectl describe no
 
@@ -192,10 +259,13 @@ kind-install-underlay-dual:
 		-e 's@^[[:space:]]*EXCLUDE_IPS=.*@EXCLUDE_IPS="$(IPV4_EXCLUDE_IPS),$(IPV6_EXCLUDE_IPS)"@' \
 		-e 's@^VLAN_ID=.*@VLAN_ID="0"@' \
 		dist/images/install.sh > install-underlay.sh
-	@chmod +x install-underlay.sh
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
-	ENABLE_SSL=true DUAL_STACK=true ENABLE_VLAN=true VLAN_NIC=eth0 ./install-underlay.sh
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
+	ENABLE_SSL=true DUAL_STACK=true ENABLE_VLAN=true VLAN_NIC=eth0 bash install-underlay.sh
 
 .PHONY: kind-install-underlay-logical-gateway-dual
 kind-install-underlay-logical-gateway-dual:
@@ -210,10 +280,70 @@ kind-install-underlay-logical-gateway-dual:
 		-e 's@^[[:space:]]*EXCLUDE_IPS=.*@EXCLUDE_IPS="$(IPV4_EXCLUDE_IPS),$(IPV6_EXCLUDE_IPS)"@' \
 		-e 's@^VLAN_ID=.*@VLAN_ID="0"@' \
 		dist/images/install.sh > install-underlay.sh
-	@chmod +x install-underlay.sh
 	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
-	kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-
-	ENABLE_SSL=true DUAL_STACK=true ENABLE_VLAN=true VLAN_NIC=eth0 LOGICAL_GATEWAY=true ./install-underlay.sh
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
+	ENABLE_SSL=true DUAL_STACK=true ENABLE_VLAN=true VLAN_NIC=eth0 LOGICAL_GATEWAY=true bash install-underlay.sh
+
+.PHONY: kind-install-multus
+kind-install-multus:
+	if ! docker images --format "{{.Repository}}:{{.Tag}}" | grep -qw "^$(MULTUS_IMAGE)$$"; then \
+		docker pull "$(MULTUS_IMAGE)"; \
+	fi
+	kind load docker-image --name kube-ovn "$(MULTUS_IMAGE)"
+	kubectl apply -f "$(MULTUS_YAML)"
+	kubectl -n kube-system rollout status ds kube-multus-ds
+	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
+	ENABLE_SSL=true CNI_CONFIG_PRIORITY=10 dist/images/install.sh
+	kubectl describe no
+
+.PHONY: kind-install-ic
+kind-install-ic:
+	docker run -d --name ovn-ic-db --network kind $(REGISTRY)/kube-ovn:$(RELEASE_TAG) bash start-ic-db.sh
+	@set -e; \
+	ic_db_host=$$(docker inspect ovn-ic-db -f "{{.NetworkSettings.Networks.kind.IPAddress}}"); \
+	zone=az0 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn-control-plane j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-0.yaml; \
+	zone=az1 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn1-control-plane j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-1.yaml
+	kubectl config use-context kind-kube-ovn
+	kubectl apply -f ovn-ic-0.yaml
+	kubectl config use-context kind-kube-ovn1
+	kubectl apply -f ovn-ic-1.yaml
+
+.PHONY: kind-install-cilium
+kind-install-cilium:
+	$(eval KUBERNETES_SERVICE_HOST = $(shell kubectl get nodes kube-ovn-control-plane -o jsonpath='{.status.addresses[0].address}'))
+	if ! docker images --format "{{.Repository}}:{{.Tag}}" | grep -qw "^$(CILIUM_IMAGE_REPO):v$(CILIUM_VERSION)$$"; then \
+		docker pull "$(CILIUM_IMAGE_REPO):v$(CILIUM_VERSION)"; \
+	fi
+	kind load docker-image --name kube-ovn "$(CILIUM_IMAGE_REPO):v$(CILIUM_VERSION)"
+	kubectl apply -f yamls/chaining.yaml
+	helm repo add cilium https://helm.cilium.io/
+	helm install cilium cilium/cilium \
+		--version $(CILIUM_VERSION) \
+		--namespace=kube-system \
+		--set k8sServiceHost=$(KUBERNETES_SERVICE_HOST) \
+		--set k8sServicePort=6443 \
+		--set tunnel=disabled \
+		--set enableIPv4Masquerade=false \
+		--set enableIdentityMark=false \
+		--set kubeProxyReplacement=strict \
+		--set cni.chainingMode=generic-veth \
+		--set cni.customConf=true \
+		--set cni.configMap=cni-configuration
+	kubectl -n kube-system rollout status ds cilium --timeout 300s
+
+	$(eval TAINTS = $(shell kubectl get no kube-ovn-control-plane -o jsonpath={.spec.taints}))
+	$(eval MASTER_TAINT = "node-role.kubernetes.io/master")
+	@if [[ "${TAINTS}" =~ .*"${MASTER_TAINT}".* ]]; then \
+		kubectl taint node kube-ovn-control-plane node-role.kubernetes.io/master:NoSchedule-; \
+	fi
+
+	kind load docker-image --name kube-ovn $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
+	ENABLE_SSL=true ENABLE_LB=false ENABLE_NP=false WITHOUT_KUBE_PROXY=true bash dist/images/install.sh
+	kubectl describe no
 
 .PHONY: kind-reload
 kind-reload:
@@ -225,6 +355,13 @@ kind-reload:
 .PHONY: kind-clean
 kind-clean:
 	kind delete cluster --name=kube-ovn
+	docker ps -a -f name=kube-ovn-e2e --format "{{.ID}}" | while read c; do docker rm -f $$c; done
+
+.PHONY: kind-clean-cluster
+kind-clean-cluster:
+	kind delete cluster --name=kube-ovn
+	kind delete cluster --name=kube-ovn1
+	docker ps -a -f name=ovn-ic-db --format "{{.ID}}" | while read c; do docker rm -f $$c; done
 
 .PHONY: uninstall
 uninstall:
@@ -239,10 +376,17 @@ lint:
 	@GOOS=linux go vet ./...
 	@GOOS=linux gosec -exclude=G204,G601 ./...
 
+.PHONY: lint-windows
+lint-windows:
+	@GOOS=windows go vet ./cmd/windows/...
+	@GOOS=windows gosec -exclude=G204,G601 ./pkg/util
+	@GOOS=windows gosec -exclude=G204,G601 ./pkg/request
+	@GOOS=windows gosec -exclude=G204,G601 ./cmd/cni
+
 .PHONY: scan
 scan:
-	trivy image --light --exit-code=1 --severity=HIGH --ignore-unfixed kubeovn/kube-ovn:$(RELEASE_TAG)
-	trivy image --light --exit-code=1 --severity=HIGH --ignore-unfixed kubeovn/vpc-nat-gateway:$(RELEASE_TAG)
+	trivy image --light --exit-code=1 --severity=HIGH --ignore-unfixed $(REGISTRY)/kube-ovn:$(RELEASE_TAG)
+	trivy image --light --exit-code=1 --severity=HIGH --ignore-unfixed $(REGISTRY)/vpc-nat-gateway:$(RELEASE_TAG)
 
 .PHONY: ut
 ut:
@@ -252,6 +396,7 @@ ut:
 e2e:
 	$(eval NODE_COUNT = $(shell kind get nodes --name kube-ovn | wc -l))
 	$(eval NETWORK_BRIDGE = $(shell docker inspect -f '{{json .NetworkSettings.Networks.bridge}}' kube-ovn-control-plane))
+	docker run -d --name kube-ovn-e2e --network kind --cap-add=NET_ADMIN $(REGISTRY)/kube-ovn:$(RELEASE_TAG) sleep infinity
 	@if [ '$(NETWORK_BRIDGE)' = 'null' ]; then \
 		kind get nodes --name kube-ovn | while read node; do \
 		docker network connect bridge $$node; \
@@ -295,11 +440,21 @@ e2e-underlay-single-nic:
 	@docker inspect -f '{{json .NetworkSettings.Networks.kind}}' kube-ovn-control-plane > test/e2e-underlay-single-nic/node/network.json
 	ginkgo -mod=mod -progress -reportPassed --slowSpecThreshold=60 test/e2e-underlay-single-nic
 
+.PHONY: e2e-ovn-ic
+e2e-ovn-ic:
+	ginkgo -mod=mod -progress -reportPassed --slowSpecThreshold=60 test/e2e-ovnic
+
+.PHONY: e2e-ovn-ebpf
+e2e-ovn-ebpf:
+	docker run -d --name kube-ovn-e2e --network kind --cap-add=NET_ADMIN $(REGISTRY)/kube-ovn:$(RELEASE_TAG) sleep infinity
+	ginkgo -mod=mod -progress -reportPassed --slowSpecThreshold=60 test/e2e-ebpf
+
 .PHONY: clean
 clean:
 	$(RM) dist/images/kube-ovn dist/images/kube-ovn-cmd
 	$(RM) yamls/kind.yaml
 	$(RM) ovn.yaml kube-ovn.yaml kube-ovn-crd.yaml
+	$(RM) ovn-ic-0.yaml ovn-ic-1.yaml
 	$(RM) kube-ovn.tar vpc-nat-gateway.tar image-amd64.tar image-arm64.tar
 	$(RM) test/e2e/ovnnb_db.* test/e2e/ovnsb_db.*
 	$(RM) install-underlay.sh

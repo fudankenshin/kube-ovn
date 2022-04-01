@@ -121,9 +121,27 @@ type SubnetSpec struct {
 	Vlan   string `json:"vlan,omitempty"`
 	HtbQos string `json:"htbqos,omitempty"`
 
+	Vips []string `json:"vips,omitempty"`
+
 	LogicalGateway         bool `json:"logicalGateway"`
 	DisableGatewayCheck    bool `json:"disableGatewayCheck"`
 	DisableInterConnection bool `json:"disableInterConnection"`
+
+	EnableDHCP    bool   `json:"enableDHCP"`
+	DHCPv4Options string `json:"dhcpV4Options"`
+	DHCPv6Options string `json:"dhcpV6Options"`
+
+	EnableIPv6RA  bool   `json:"enableIPv6RA"`
+	IPv6RAConfigs string `json:"ipv6RAConfigs"`
+
+	Acls []Acl `json:"acls,omitempty"`
+}
+
+type Acl struct {
+	Direction string `json:"direction,omitempty"`
+	Priority  int    `json:"priority,omitempty"`
+	Match     string `json:"match,omitempty"`
+	Action    string `json:"action,omitempty"`
 }
 
 // ConditionType encodes information on the condition
@@ -157,13 +175,15 @@ type SubnetStatus struct {
 	// +patchStrategy=merge
 	Conditions []SubnetCondition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 
-	AvailableIPs    float64 `json:"availableIPs"`
-	UsingIPs        float64 `json:"usingIPs"`
-	V4AvailableIPs  float64 `json:"v4availableIPs"`
-	V4UsingIPs      float64 `json:"v4usingIPs"`
-	V6AvailableIPs  float64 `json:"v6availableIPs"`
-	V6UsingIPs      float64 `json:"v6usingIPs"`
-	ActivateGateway string  `json:"activateGateway"`
+	AvailableIPs      float64 `json:"availableIPs"`
+	UsingIPs          float64 `json:"usingIPs"`
+	V4AvailableIPs    float64 `json:"v4availableIPs"`
+	V4UsingIPs        float64 `json:"v4usingIPs"`
+	V6AvailableIPs    float64 `json:"v6availableIPs"`
+	V6UsingIPs        float64 `json:"v6usingIPs"`
+	ActivateGateway   string  `json:"activateGateway"`
+	DHCPv4OptionsUUID string  `json:"dhcpV4OptionsUUID"`
+	DHCPv6OptionsUUID string  `json:"dhcpV6OptionsUUID"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -199,13 +219,11 @@ type VlanSpec struct {
 type VlanStatus struct {
 	// +optional
 	// +patchStrategy=merge
-	Subnets []string `json:"subnets,omitempty" patchStrategy:"merge"`
+	Subnets []string `json:"subnets,omitempty"`
 
 	// Conditions represents the latest state of the object
 	// +optional
-	// +patchMergeKey=type
-	// +patchStrategy=merge
-	Conditions []VlanCondition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+	Conditions []VlanCondition `json:"conditions,omitempty"`
 }
 
 // Condition describes the state of an object at a certain point.
@@ -263,22 +281,17 @@ type ProviderNetworkSpec struct {
 
 type ProviderNetworkStatus struct {
 	// +optional
-	// +patchStrategy=merge
-	Ready bool `json:"ready" patchStrategy:"merge"`
+	Ready bool `json:"ready"`
 
 	// +optional
-	// +patchStrategy=merge
-	ReadyNodes []string `json:"readyNodes,omitempty" patchStrategy:"merge"`
+	ReadyNodes []string `json:"readyNodes,omitempty"`
 
 	// +optional
-	// +patchStrategy=merge
-	Vlans []string `json:"vlans,omitempty" patchStrategy:"merge"`
+	Vlans []string `json:"vlans,omitempty"`
 
 	// Conditions represents the latest state of the object
 	// +optional
-	// +patchMergeKey=node
-	// +patchStrategy=merge
-	Conditions []ProviderNetworkCondition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"node"`
+	Conditions []ProviderNetworkCondition `json:"conditions,omitempty"`
 }
 
 // Condition describes the state of an object at a certain point.
@@ -329,6 +342,12 @@ type VpcSpec struct {
 	Namespaces   []string       `json:"namespaces,omitempty"`
 	StaticRoutes []*StaticRoute `json:"staticRoutes,omitempty"`
 	PolicyRoutes []*PolicyRoute `json:"policyRoutes,omitempty"`
+	VpcPeerings  []*VpcPeering  `json:"vpcPeerings,omitempty"`
+}
+
+type VpcPeering struct {
+	RemoteVpc      string `json:"remoteVpc,omitempty"`
+	LocalConnectIP string `json:"localConnectIP,omitempty"`
 }
 
 type RoutePolicy string
@@ -377,6 +396,7 @@ type VpcStatus struct {
 	TcpSessionLoadBalancer string   `json:"tcpSessionLoadBalancer"`
 	UdpSessionLoadBalancer string   `json:"udpSessionLoadBalancer"`
 	Subnets                []string `json:"subnets"`
+	VpcPeerings            []string `json:"vpcPeerings"`
 }
 
 // Condition describes the state of an object at a certain point.
@@ -425,6 +445,7 @@ type VpcNatSpec struct {
 	Vpc             string            `json:"vpc"`
 	Subnet          string            `json:"subnet"`
 	LanIp           string            `json:"lanIp"`
+	Selector        []string          `json:"selector"`
 	Eips            []*Eip            `json:"eips,omitempty"`
 	FloatingIpRules []*FloutingIpRule `json:"floatingIpRules,omitempty"`
 	DnatRules       []*DnatRule       `json:"dnatRules,omitempty"`

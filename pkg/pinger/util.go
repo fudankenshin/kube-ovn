@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/greenpau/ovsdb"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // IncrementErrorCounter increases the counter of failed queries to OVN server.
@@ -230,4 +230,45 @@ func (e *Exporter) setOvsInterfaceStatisticsMetric(intf *ovsdb.OvsInterface) {
 			klog.Errorf("OVS interface statistics has unsupported key: %s, value: %d", key, value)
 		}
 	}
+}
+
+func resetOvsDatapathMetrics() {
+	metricOvsDpFlowsTotal.Reset()
+	metricOvsDpFlowsLookupHit.Reset()
+	metricOvsDpFlowsLookupMissed.Reset()
+	metricOvsDpFlowsLookupLost.Reset()
+
+	metricOvsDpMasksHit.Reset()
+	metricOvsDpMasksTotal.Reset()
+	metricOvsDpMasksHitRatio.Reset()
+
+	metricOvsDp.Reset()
+	metricOvsDpTotal.Reset()
+	metricOvsDpIf.Reset()
+	metricOvsDpIfTotal.Reset()
+}
+
+func resetOvsInterfaceMetrics() {
+	interfaceMain.Reset()
+	interfaceAdminState.Reset()
+	interfaceLinkState.Reset()
+	interfaceMacInUse.Reset()
+	interfaceMtu.Reset()
+	interfaceOfPort.Reset()
+	interfaceIfIndex.Reset()
+
+	interfaceStatRxCrcError.Reset()
+	interfaceStatRxDropped.Reset()
+	interfaceStatRxFrameError.Reset()
+	interfaceStatRxMissedError.Reset()
+	interfaceStatRxOverrunError.Reset()
+	interfaceStatRxErrorsTotal.Reset()
+	interfaceStatRxPackets.Reset()
+	interfaceStatRxBytes.Reset()
+
+	interfaceStatTxPackets.Reset()
+	interfaceStatTxBytes.Reset()
+	interfaceStatTxDropped.Reset()
+	interfaceStatTxErrorsTotal.Reset()
+	interfaceStatCollisions.Reset()
 }

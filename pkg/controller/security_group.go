@@ -8,16 +8,16 @@ import (
 	"strings"
 
 	"github.com/cnf/structhash"
-	"github.com/kubeovn/kube-ovn/pkg/ovs"
-	"github.com/kubeovn/kube-ovn/pkg/util"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/ovs"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 func (c *Controller) enqueueAddSg(obj interface{}) {
@@ -212,13 +212,14 @@ func (c *Controller) handleAddOrUpdateSg(key string) error {
 		}
 	}
 
-	sg, err := c.sgsLister.Get(key)
+	orisg, err := c.sgsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	sg := orisg.DeepCopy()
 
 	if err = c.validateSgRule(sg); err != nil {
 		return err
@@ -398,7 +399,7 @@ func (c *Controller) syncSgLogicalPort(key string) error {
 }
 
 func (c *Controller) getPortSg(portName string) ([]string, error) {
-	results, err := c.ovnClient.CustomFindEntity("logical_switch_port", []string{"name", "external_ids"}, fmt.Sprintf("name=%s", portName))
+	results, err := c.ovnClient.CustomFindEntity("logical_switch_port", []string{"external_ids"}, fmt.Sprintf("name=%s", portName))
 	if err != nil {
 		klog.Errorf("customFindEntity failed, %v", err)
 		return nil, err
@@ -409,9 +410,9 @@ func (c *Controller) getPortSg(portName string) ([]string, error) {
 	extIds := results[0]["external_ids"]
 	var sgList []string
 	for _, value := range extIds {
-		if strings.HasPrefix(value, "security_groups=") {
-			sgStr := strings.Split(value, "security_groups=")[1]
-			sgList = strings.Split(sgStr, ",")
+		if strings.HasPrefix(value, "associated_sg_") && strings.HasSuffix(value, "true") {
+			sgName := strings.ReplaceAll(strings.Split(value, "=")[0], "associated_sg_", "")
+			sgList = append(sgList, sgName)
 		}
 	}
 	return sgList, nil
@@ -442,7 +443,7 @@ func (c *Controller) reconcilePortSg(portName, securityGroups string) error {
 		c.syncSgPortsQueue.Add(sgName)
 	}
 
-	if err = c.ovnClient.SetPortExternalIds(portName, "security_groups", securityGroups); err != nil {
+	if err = c.ovnClient.SetPortExternalIds(portName, "security_groups", strings.ReplaceAll(securityGroups, ",", "/")); err != nil {
 		klog.Errorf("set port '%s' external_ids failed, %v", portName, err)
 		return err
 	}

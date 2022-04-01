@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof" // #nosec
+	"os"
 	"strings"
 	"time"
 
@@ -14,7 +14,7 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kubeinformers "k8s.io/client-go/informers"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/sample-controller/pkg/signals"
 
 	kubeovninformer "github.com/kubeovn/kube-ovn/pkg/client/informers/externalversions"
@@ -29,11 +29,13 @@ func CmdMain() {
 	klog.Infof(versions.String())
 	daemon.InitMetrics()
 	util.InitKlogMetrics()
-	if err := daemon.InitOVSBridges(); err != nil {
+
+	nicBridgeMappings, err := daemon.InitOVSBridges()
+	if err != nil {
 		klog.Fatalf("failed to initialize OVS bridges: %v", err)
 	}
 
-	config, err := daemon.ParseFlags()
+	config, err := daemon.ParseFlags(nicBridgeMappings)
 	if err != nil {
 		klog.Fatalf("parse config failed %v", err)
 	}
@@ -73,19 +75,21 @@ func CmdMain() {
 	kubeovnInformerFactory.Start(stopCh)
 	go ctl.Run(stopCh)
 	go daemon.RunServer(config, ctl)
-	if err := mvCNIConf(); err != nil {
+	if err := mvCNIConf(config.CniConfName); err != nil {
 		klog.Fatalf("failed to mv cni conf, %v", err)
 	}
 	http.Handle("/metrics", promhttp.Handler())
 	klog.Fatal(http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", config.PprofPort), nil))
 }
 
-func mvCNIConf() error {
-	data, err := ioutil.ReadFile("/kube-ovn/01-kube-ovn.conflist")
+func mvCNIConf(confName string) error {
+	data, err := os.ReadFile("/kube-ovn/01-kube-ovn.conflist")
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile("/etc/cni/net.d/01-kube-ovn.conflist", data, 0444)
+
+	cniConfPath := fmt.Sprintf("/etc/cni/net.d/%s", confName)
+	return os.WriteFile(cniConfPath, data, 0444)
 }
 
 func Retry(attempts int, sleep int, f func(configuration *daemon.Configuration) error, ctrl *daemon.Configuration) (err error) {
@@ -103,7 +107,7 @@ func Retry(attempts int, sleep int, f func(configuration *daemon.Configuration) 
 }
 
 func initChassisAnno(cfg *daemon.Configuration) error {
-	chassisID, err := ioutil.ReadFile(util.ChassisLoc)
+	chassisID, err := os.ReadFile(util.ChassisLoc)
 	if err != nil {
 		klog.Errorf("read chassis file failed, %v", err)
 		return err

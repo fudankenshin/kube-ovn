@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	clientset "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -26,45 +26,51 @@ import (
 
 // Configuration is the daemon conf
 type Configuration struct {
-	Iface                 string
-	MTU                   int
-	MSS                   int
-	EnableMirror          bool
-	MirrorNic             string
-	BindSocket            string
-	OvsSocket             string
-	KubeConfigFile        string
-	KubeClient            kubernetes.Interface
-	KubeOvnClient         clientset.Interface
-	NodeName              string
-	ServiceClusterIPRange string
-	NodeLocalDnsIP        string
-	EncapChecksum         bool
-	PprofPort             int
-	NetworkType           string
-	DefaultProviderName   string
-	DefaultInterfaceName  string
+	Iface                   string
+	DPDKTunnelIface         string
+	MTU                     int
+	MSS                     int
+	EnableMirror            bool
+	MirrorNic               string
+	BindSocket              string
+	OvsSocket               string
+	KubeConfigFile          string
+	KubeClient              kubernetes.Interface
+	KubeOvnClient           clientset.Interface
+	NodeName                string
+	ServiceClusterIPRange   string
+	NodeLocalDnsIP          string
+	EncapChecksum           bool
+	PprofPort               int
+	NetworkType             string
+	CniConfName             string
+	DefaultProviderName     string
+	DefaultInterfaceName    string
+	ExternalGatewayConfigNS string
 }
 
 // ParseFlags will parse cmd args then init kubeClient and configuration
 // TODO: validate configuration
-func ParseFlags() (*Configuration, error) {
+func ParseFlags(nicBridgeMappings map[string]string) (*Configuration, error) {
 	var (
-		argIface                 = pflag.String("iface", "", "The iface used to inter-host pod communication, can be a nic name or a group of regex separated by comma, default: the default route iface")
-		argMTU                   = pflag.Int("mtu", 0, "The MTU used by pod iface in overlay networks, default: iface MTU - 100")
-		argEnableMirror          = pflag.Bool("enable-mirror", false, "Enable traffic mirror, default: false")
-		argMirrorNic             = pflag.String("mirror-iface", "mirror0", "The mirror nic name that will be created by kube-ovn, default: mirror0")
+		argIface                 = pflag.String("iface", "", "The iface used to inter-host pod communication, can be a nic name or a group of regex separated by comma (default the default route iface)")
+		argDPDKTunnelIface       = pflag.String("dpdk-tunnel-iface", "br-phy", "Specifies the name of the dpdk tunnel iface.")
+		argMTU                   = pflag.Int("mtu", 0, "The MTU used by pod iface in overlay networks (default iface MTU - 100)")
+		argEnableMirror          = pflag.Bool("enable-mirror", false, "Enable traffic mirror (default false)")
+		argMirrorNic             = pflag.String("mirror-iface", "mirror0", "The mirror nic name that will be created by kube-ovn")
 		argBindSocket            = pflag.String("bind-socket", "/run/openvswitch/kube-ovn-daemon.sock", "The socket daemon bind to.")
 		argOvsSocket             = pflag.String("ovs-socket", "", "The socket to local ovs-server")
 		argKubeConfigFile        = pflag.String("kubeconfig", "", "Path to kubeconfig file with authorization and master location information. If not set use the inCluster token.")
-		argServiceClusterIPRange = pflag.String("service-cluster-ip-range", "10.96.0.0/12", "The kubernetes service cluster ip range, default: 10.96.0.0/12")
-		argNodeLocalDnsIP        = pflag.String("node-local-dns-ip", "", "If use nodelocaldns the local dns server ip should be set here, default empty.")
-		argEncapChecksum         = pflag.Bool("encap-checksum", true, "Enable checksum, default: true")
-		argPprofPort             = pflag.Int("pprof-port", 10665, "The port to get profiling data, default: 10665")
+		argServiceClusterIPRange = pflag.String("service-cluster-ip-range", "10.96.0.0/12", "The kubernetes service cluster ip range")
+		argNodeLocalDnsIP        = pflag.String("node-local-dns-ip", "", "If use nodelocaldns the local dns server ip should be set here.")
+		argEncapChecksum         = pflag.Bool("encap-checksum", true, "Enable checksum")
+		argPprofPort             = pflag.Int("pprof-port", 10665, "The port to get profiling data")
 
-		argsNetworkType          = pflag.String("network-type", "geneve", "The ovn network type, default: geneve")
-		argsDefaultProviderName  = pflag.String("default-provider-name", "provider", "The vlan or vxlan type default provider interface name, default: provider")
-		argsDefaultInterfaceName = pflag.String("default-interface-name", "", "The default host interface name in the vlan/vxlan type")
+		argsNetworkType            = pflag.String("network-type", "geneve", "The ovn network type")
+		argsCniConfName            = pflag.String("cni-conf-name", "01-kube-ovn.conflist", "Specify the name of kube ovn conflist name in dir /etc/cni/net.d/, default: 01-kube-ovn.conflist")
+		argsDefaultProviderName    = pflag.String("default-provider-name", "provider", "The vlan or vxlan type default provider interface name")
+		argsDefaultInterfaceName   = pflag.String("default-interface-name", "", "The default host interface name in the vlan/vxlan type")
+		argExternalGatewayConfigNS = pflag.String("external-gateway-config-ns", "kube-system", "The namespace of configmap external-gateway-config, default: kube-system")
 	)
 
 	// mute info log for ipset lib
@@ -74,7 +80,7 @@ func ParseFlags() (*Configuration, error) {
 	klog.InitFlags(klogFlags)
 
 	// Sync the glog and klog flags.
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
+	pflag.CommandLine.VisitAll(func(f1 *pflag.Flag) {
 		f2 := klogFlags.Lookup(f1.Name)
 		if f2 != nil {
 			value := f1.Value.String()
@@ -94,28 +100,31 @@ func ParseFlags() (*Configuration, error) {
 		return nil, fmt.Errorf("env KUBE_NODE_NAME not exists")
 	}
 	config := &Configuration{
-		Iface:                 *argIface,
-		MTU:                   *argMTU,
-		EnableMirror:          *argEnableMirror,
-		MirrorNic:             *argMirrorNic,
-		BindSocket:            *argBindSocket,
-		OvsSocket:             *argOvsSocket,
-		KubeConfigFile:        *argKubeConfigFile,
-		PprofPort:             *argPprofPort,
-		NodeName:              nodeName,
-		ServiceClusterIPRange: *argServiceClusterIPRange,
-		NodeLocalDnsIP:        *argNodeLocalDnsIP,
-		EncapChecksum:         *argEncapChecksum,
-		NetworkType:           *argsNetworkType,
-		DefaultProviderName:   *argsDefaultProviderName,
-		DefaultInterfaceName:  *argsDefaultInterfaceName,
+		Iface:                   *argIface,
+		DPDKTunnelIface:         *argDPDKTunnelIface,
+		MTU:                     *argMTU,
+		EnableMirror:            *argEnableMirror,
+		MirrorNic:               *argMirrorNic,
+		BindSocket:              *argBindSocket,
+		OvsSocket:               *argOvsSocket,
+		KubeConfigFile:          *argKubeConfigFile,
+		PprofPort:               *argPprofPort,
+		NodeName:                nodeName,
+		ServiceClusterIPRange:   *argServiceClusterIPRange,
+		NodeLocalDnsIP:          *argNodeLocalDnsIP,
+		EncapChecksum:           *argEncapChecksum,
+		NetworkType:             *argsNetworkType,
+		CniConfName:             *argsCniConfName,
+		DefaultProviderName:     *argsDefaultProviderName,
+		DefaultInterfaceName:    *argsDefaultInterfaceName,
+		ExternalGatewayConfigNS: *argExternalGatewayConfigNS,
 	}
 
 	if err := config.initKubeClient(); err != nil {
 		return nil, err
 	}
 
-	if err := config.initNicConfig(); err != nil {
+	if err := config.initNicConfig(nicBridgeMappings); err != nil {
 		return nil, err
 	}
 
@@ -123,14 +132,14 @@ func ParseFlags() (*Configuration, error) {
 	return config, nil
 }
 
-func (config *Configuration) initNicConfig() error {
+func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) error {
 	var (
 		iface   *net.Interface
 		err     error
 		encapIP string
 	)
 
-	//Support to specify node network card separately
+	// Support to specify node network card separately
 	node, err := config.KubeClient.CoreV1().Nodes().Get(context.Background(), config.NodeName, metav1.GetOptions{})
 	if err != nil {
 		klog.Errorf("Failed to find node info, err: %v", err)
@@ -141,8 +150,13 @@ func (config *Configuration) initNicConfig() error {
 		klog.Infof("Find node tunnel interface name: %v", nodeTunnelName)
 	}
 
+	isDPDKNode := node.GetLabels()[util.OvsDpTypeLabel] == "userspace"
+
+	if isDPDKNode {
+		config.Iface = config.DPDKTunnelIface
+	}
 	if config.Iface == "" {
-		podIP, ok := os.LookupEnv("POD_IP")
+		podIP, ok := os.LookupEnv(util.POD_IP)
 		if !ok || podIP == "" {
 			return errors.New("failed to lookup env POD_IP")
 		}
@@ -153,9 +167,15 @@ func (config *Configuration) initNicConfig() error {
 		}
 		encapIP = podIP
 	} else {
-		iface, err = findInterface(config.Iface)
+		tunnelNic := config.Iface
+		if brName := nicBridgeMappings[tunnelNic]; brName != "" {
+			klog.Infof("nic %s has been bridged to %s, use %s as the tunnel interface instead", tunnelNic, brName, brName)
+			tunnelNic = brName
+		}
+
+		iface, err = findInterface(tunnelNic)
 		if err != nil {
-			klog.Errorf("failed to find iface %s, %v", config.Iface, err)
+			klog.Errorf("failed to find iface %s, %v", tunnelNic, err)
 			return err
 		}
 		addrs, err := iface.Addrs()
@@ -163,7 +183,7 @@ func (config *Configuration) initNicConfig() error {
 			return fmt.Errorf("failed to get iface addr. %v", err)
 		}
 		if len(addrs) == 0 {
-			return fmt.Errorf("iface %s has no ip address", config.Iface)
+			return fmt.Errorf("iface %s has no ip address", tunnelNic)
 		}
 		encapIP = strings.Split(addrs[0].String(), "/")[0]
 	}
@@ -234,8 +254,8 @@ func (config *Configuration) initKubeClient() error {
 	}
 	config.KubeOvnClient = kubeOvnClient
 
-	cfg.ContentType = "application/vnd.kubernetes.protobuf"
-	cfg.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
+	cfg.ContentType = util.ContentType
+	cfg.AcceptContentTypes = util.AcceptContentTypes
 	kubeClient, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		klog.Errorf("init kubernetes client failed %v", err)

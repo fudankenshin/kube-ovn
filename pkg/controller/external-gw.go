@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
@@ -22,7 +22,7 @@ var (
 )
 
 func (c *Controller) resyncExternalGateway() {
-	cm, err := c.configMapsLister.ConfigMaps(c.config.PodNamespace).Get(util.ExternalGatewayConfig)
+	cm, err := c.configMapsLister.ConfigMaps(c.config.ExternalGatewayConfigNS).Get(util.ExternalGatewayConfig)
 	if err != nil && !k8serrors.IsNotFound(err) {
 		klog.Errorf("failed to get ovn-external-gw-config, %v", err)
 		return
@@ -72,7 +72,8 @@ func (c *Controller) removeExternalGateway() error {
 		klog.Errorf("failed to list nodes, %v", err)
 		return err
 	}
-	for _, no := range nodes {
+	for _, orino := range nodes {
+		no := orino.DeepCopy()
 		patchPayloadTemplate :=
 			`[{
         "op": "%s",
@@ -116,11 +117,12 @@ func (c *Controller) establishExternalGateway(config map[string]string) error {
 	}
 	for _, gw := range gwNodes {
 		gw = strings.TrimSpace(gw)
-		node, err := c.nodesLister.Get(gw)
+		orinode, err := c.nodesLister.Get(gw)
 		if err != nil {
 			klog.Errorf("failed to get gw node %s, %v", gw, err)
 			return err
 		}
+		node := orinode.DeepCopy()
 		patchPayloadTemplate :=
 			`[{
         "op": "%s",
@@ -154,7 +156,7 @@ func (c *Controller) establishExternalGateway(config map[string]string) error {
 		return fmt.Errorf("no available external gw")
 	}
 
-	if err := c.ovnClient.CreateGatewaySwitch(util.ExternalGatewaySwitch, config["nic-ip"], config["nic-mac"], chassises); err != nil {
+	if err := c.ovnClient.CreateGatewaySwitch(util.ExternalGatewaySwitch, c.config.ExternalGatewayNet, c.config.ExternalGatewayVlanID, config["nic-ip"], config["nic-mac"], chassises); err != nil {
 		klog.Errorf("failed to create external gateway switch, %v", err)
 		return err
 	}

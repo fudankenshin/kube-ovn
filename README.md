@@ -16,7 +16,7 @@ Kube-OVN, a [CNCF Sandbox Level Project](https://www.cncf.io/sandbox-projects/),
 The Kube-OVN community is waiting for your participation!
 - Follow us at [Twitter](https://twitter.com/KubeOvn)
 - Chat with us at [Slack](https://kube-ovn-slackin.herokuapp.com/)
-- 微信用户扫码加小助手进入社区交流群，请注明 Kube-OVN
+- 微信用户扫码加入交流群
 
   ![Image of wechat](./docs/wechat.png)
 
@@ -44,6 +44,7 @@ The Kube-OVN community is waiting for your participation!
 - **Hardware Offload**: Boost network performance and save CPU resource by offloading OVS flow table to hardware.
 - **DPDK Support**: DPDK application now can run in Pod with OVS-DPDK.
 - **Cilium Integration**: Cilium can take over the work of Kube-proxy.
+- **F5 CES Integration**: F5 can help better manage the outgoing traffic of k8s pod/container.
 
 ## Planned Future Work
 - Policy-based QoS
@@ -82,7 +83,7 @@ If you want to install Kubernetes from scratch, you can try [kubespray](https://
   - [Kubernetes and OpenStack based on the same OVN deployment](docs/OpenstackOnKubernetes.md)
 - [BGP support](docs/bgp.md)
 - [Multi NIC Support](docs/multi-nic.md)
-- [Hardware Offload](docs/hw-offload.md)
+- Hardware Offload for [Mellanox](docs/hw-offload-mellanox.md) and [Corigine](docs/hw-offload-corigine.md)
 - [Vlan/Underlay Support](docs/vlan.md)
 - [DPDK Support](docs/dpdk.md)
 - [Traffic Mirror](docs/mirror.md)
@@ -94,6 +95,7 @@ If you want to install Kubernetes from scratch, you can try [kubespray](https://
 - [Metrics](docs/ovn-ovs-monitor.md)
 - [Performance Tuning](docs/performance-tuning.md)
 - [Cilium Integration](docs/IntegrateCiliumIntoKubeOVN.md)
+- [F5 CES Integration](https://github.com/f5devcentral/container-egress-service/wiki)
 
 ## Contribution
 We are looking forwards to your PR!

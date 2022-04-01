@@ -37,6 +37,7 @@ const (
 
 	AllocatedAnnotationSuffix       = ".kubernetes.io/allocated"
 	AllocatedAnnotationTemplate     = "%s.kubernetes.io/allocated"
+	RoutedAnnotationTemplate        = "%s.kubernetes.io/routed"
 	MacAddressAnnotationTemplate    = "%s.kubernetes.io/mac_address"
 	IpAddressAnnotationTemplate     = "%s.kubernetes.io/ip_address"
 	CidrAnnotationTemplate          = "%s.kubernetes.io/cidr"
@@ -58,6 +59,8 @@ const (
 	ProviderNetworkInterfaceTemplate = "%s.provider-network.kubernetes.io/interface"
 	ProviderNetworkMtuTemplate       = "%s.provider-network.kubernetes.io/mtu"
 	MirrorControlAnnotationTemplate  = "%s.kubernetes.io/mirror"
+	PodNicAnnotationTemplate         = "%s.kubernetes.io/pod_nic_type"
+	VmTemplate                       = "%s.kubernetes.io/virtualmachine"
 
 	ExcludeIpsAnnotation = "ovn.kubernetes.io/exclude_ips"
 
@@ -68,6 +71,8 @@ const (
 	LogicalSwitchAnnotation = "ovn.kubernetes.io/logical_switch"
 
 	TunnelInterfaceAnnotation = "ovn.kubernetes.io/tunnel_interface"
+
+	OvsDpTypeLabel = "ovn.kubernetes.io/ovs_dp_type"
 
 	SubnetNameLabel    = "ovn.kubernetes.io/subnet"
 	ICGatewayLabel     = "ovn.kubernetes.io/ic-gw"
@@ -114,22 +119,27 @@ const (
 	VpcExternalNet         = "ovn-vpc-external-network"
 	VpcLbNetworkAttachment = "ovn-vpc-lb"
 
-	DefaultVpc = "ovn-cluster"
+	DefaultVpc    = "ovn-cluster"
+	DefaultSubnet = "ovn-default"
 
 	EcmpRouteType   = "ecmp"
 	NormalRouteType = "normal"
 
+	PodRouterPolicyPriority  = 20000
+	CentralSubnetPriority    = 25000
 	NodeRouterPolicyPriority = 30000
 
-	PodNicAnnotation = "ovn.kubernetes.io/pod_nic_type"
-	VethType         = "veth-pair"
-	OffloadType      = "offload-port"
-	InternalType     = "internal-port"
+	OffloadType  = "offload-port"
+	InternalType = "internal-port"
+	DpdkType     = "dpdk-port"
+
+	DefaultHostVhostuserBaseDir = "/run/openvswitch/vhost_sockets"
 
 	ChassisLoc     = "/etc/openvswitch/system-id.conf"
 	HostnameEnv    = "KUBE_NODE_NAME"
 	ChasRetryTime  = 5
 	ChasRetryIntev = 1
+	VmInstance     = "VirtualMachineInstance"
 
 	VfioSysDir = "/sys/bus/pci/drivers/vfio-pci"
 	NetSysDir  = "/sys/class/net"
@@ -155,4 +165,12 @@ const (
 	NetemQosLatencyAnnotationTemplate = "%s.kubernetes.io/latency"
 	NetemQosLimitAnnotationTemplate   = "%s.kubernetes.io/limit"
 	NetemQosLossAnnotationTemplate    = "%s.kubernetes.io/loss"
+
+	KoDir  = "/tmp/"
+	KoENV  = "MODULES"
+	RpmENV = "RPMS"
+
+	POD_IP             = "POD_IP"
+	ContentType        = "application/vnd.kubernetes.protobuf"
+	AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
 )

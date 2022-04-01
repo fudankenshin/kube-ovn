@@ -6,9 +6,10 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/klog/v2"
+
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
-	"k8s.io/klog"
 )
 
 var (
@@ -36,7 +37,7 @@ func NewIPAM() *IPAM {
 	}
 }
 
-func (ipam *IPAM) GetRandomAddress(podName, nicName, subnetName string, skippedAddrs []string) (string, string, string, error) {
+func (ipam *IPAM) GetRandomAddress(podName, nicName, mac, subnetName string, skippedAddrs []string, checkConflict bool) (string, string, string, error) {
 	ipam.mutex.RLock()
 	defer ipam.mutex.RUnlock()
 
@@ -45,7 +46,7 @@ func (ipam *IPAM) GetRandomAddress(podName, nicName, subnetName string, skippedA
 		return "", "", "", ErrNoAvailable
 	}
 
-	v4IP, v6IP, mac, err := subnet.GetRandomAddress(podName, nicName, skippedAddrs)
+	v4IP, v6IP, mac, err := subnet.GetRandomAddress(podName, nicName, mac, skippedAddrs, checkConflict)
 	klog.Infof("allocate v4 %s v6 %s mac %s for %s", v4IP, v6IP, mac, podName)
 	return string(v4IP), string(v6IP), mac, err
 }
@@ -66,7 +67,7 @@ func (ipam *IPAM) GetStaticAddress(podName, nicName, ip, mac, subnetName string,
 			}
 			ips = append(ips, ipAddr)
 		}
-		ips, err = checkAndAppendIpsForDual(ips, podName, nicName, subnet)
+		ips, err = checkAndAppendIpsForDual(ips, mac, podName, nicName, subnet, checkConflict)
 		if err != nil {
 			klog.Errorf("failed to append allocate ip %v mac %s for %s", ips, mac, podName)
 			return "", "", "", err
@@ -87,7 +88,7 @@ func (ipam *IPAM) GetStaticAddress(podName, nicName, ip, mac, subnetName string,
 	return "", "", "", ErrNoAvailable
 }
 
-func checkAndAppendIpsForDual(ips []IP, podName string, nicName string, subnet *Subnet) ([]IP, error) {
+func checkAndAppendIpsForDual(ips []IP, mac string, podName string, nicName string, subnet *Subnet, checkConflict bool) ([]IP, error) {
 	// IP Address for dual-stack should be format of 'IPv4,IPv6'
 	if subnet.Protocol != kubeovnv1.ProtocolDual || len(ips) == 2 {
 		return ips, nil
@@ -98,10 +99,10 @@ func checkAndAppendIpsForDual(ips []IP, podName string, nicName string, subnet *
 	var err error
 	if util.CheckProtocol(string(ips[0])) == kubeovnv1.ProtocolIPv4 {
 		newIps = ips
-		_, ipAddr, _, err = subnet.getV6RandomAddress(podName, nicName, nil)
+		_, ipAddr, _, err = subnet.getV6RandomAddress(podName, nicName, mac, nil, checkConflict)
 		newIps = append(newIps, ipAddr)
 	} else if util.CheckProtocol(string(ips[0])) == kubeovnv1.ProtocolIPv6 {
-		ipAddr, _, _, err = subnet.getV4RandomAddress(podName, nicName, nil)
+		ipAddr, _, _, err = subnet.getV4RandomAddress(podName, nicName, mac, nil, checkConflict)
 		newIps = append(newIps, ipAddr)
 		newIps = append(newIps, ips...)
 	}
@@ -156,6 +157,7 @@ func (ipam *IPAM) AddOrUpdateSubnet(name, cidrStr string, excludeIps []string) e
 			lastIP, _ := util.LastIP(v4cidrStr)
 			subnet.V4FreeIPList = IPRangeList{&IPRange{Start: IP(firstIP), End: IP(lastIP)}}
 			subnet.joinFreeWithReserve()
+			subnet.V4ReleasedIPList = IPRangeList{}
 			for nicName, ip := range subnet.V4NicToIP {
 				mac := subnet.NicToMac[nicName]
 				podName := subnet.V4IPToPod[ip]
@@ -172,6 +174,7 @@ func (ipam *IPAM) AddOrUpdateSubnet(name, cidrStr string, excludeIps []string) e
 			lastIP, _ := util.LastIP(v6cidrStr)
 			subnet.V6FreeIPList = IPRangeList{&IPRange{Start: IP(firstIP), End: IP(lastIP)}}
 			subnet.joinFreeWithReserve()
+			subnet.V6ReleasedIPList = IPRangeList{}
 			for nicName, ip := range subnet.V6NicToIP {
 				mac := subnet.NicToMac[nicName]
 				podName := subnet.V6IPToPod[ip]
@@ -231,13 +234,13 @@ func (ipam *IPAM) ContainAddress(address string) bool {
 	return false
 }
 
-func (ipam *IPAM) IsIPAssignedToPod(ip, subnetName string) bool {
+func (ipam *IPAM) IsIPAssignedToPod(ip, subnetName, podName string) bool {
 	ipam.mutex.RLock()
 	defer ipam.mutex.RUnlock()
 
 	if subnet, ok := ipam.Subnets[subnetName]; !ok {
 		return false
 	} else {
-		return subnet.isIPAssignedToPod(ip)
+		return subnet.isIPAssignedToPod(ip, podName)
 	}
 }

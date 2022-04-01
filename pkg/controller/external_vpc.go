@@ -3,11 +3,13 @@ package controller
 import (
 	"context"
 	"fmt"
-	v1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
-	"github.com/kubeovn/kube-ovn/pkg/util"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+
+	v1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 func (c *Controller) syncExternalVpc() {
@@ -24,7 +26,7 @@ func (c *Controller) syncExternalVpc() {
 	}
 	vpcMaps := make(map[string]*v1.Vpc)
 	for _, vpc := range vpcs {
-		vpcMaps[vpc.Name] = vpc
+		vpcMaps[vpc.Name] = vpc.DeepCopy()
 	}
 	for vpcName, vpc := range vpcMaps {
 		if _, ok := logicalRouters[vpcName]; ok {

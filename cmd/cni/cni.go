@@ -1,4 +1,4 @@
-package main
+package cni
 
 import (
 	"encoding/json"
@@ -10,7 +10,7 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
@@ -18,14 +18,12 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-func init() {
+func CmdMain() {
 	// this ensures that main runs only on main thread (thread group leader).
 	// since namespace ops (unshare, setns) are done for a single thread, we
 	// must ensure that the goroutine does not jump from OS thread to thread
 	runtime.LockOSThread()
-}
 
-func main() {
 	skel.PluginMain(cmdAdd, nil, cmdDel, version.All, "")
 }
 
@@ -42,33 +40,39 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
-	if netConf.Type == util.CniTypeName && args.IfName == "eth0" {
+	if netConf.Provider == "" && netConf.Type == util.CniTypeName && args.IfName == "eth0" {
 		netConf.Provider = util.OvnProvider
 	}
 
 	client := request.NewCniServerClient(netConf.ServerSocket)
 	response, err := client.Add(request.CniRequest{
-		CniType:      netConf.Type,
-		PodName:      podName,
-		PodNamespace: podNamespace,
-		ContainerID:  args.ContainerID,
-		NetNs:        args.Netns,
-		IfName:       args.IfName,
-		Provider:     netConf.Provider,
-		Routes:       netConf.Routes,
-		DeviceID:     netConf.DeviceID,
-		VfDriver:     netConf.VfDriver,
+		CniType:                   netConf.Type,
+		PodName:                   podName,
+		PodNamespace:              podNamespace,
+		ContainerID:               args.ContainerID,
+		NetNs:                     args.Netns,
+		IfName:                    args.IfName,
+		Provider:                  netConf.Provider,
+		Routes:                    netConf.Routes,
+		DNS:                       netConf.DNS,
+		DeviceID:                  netConf.DeviceID,
+		VfDriver:                  netConf.VfDriver,
+		VhostUserSocketVolumeName: netConf.VhostUserSocketVolumeName,
+		VhostUserSocketName:       netConf.VhostUserSocketName,
 	})
 	if err != nil {
 		return err
 	}
 
-	result := generateCNIResult(cniVersion, response)
+	result := generateCNIResult(response)
 	return types.PrintResult(&result, cniVersion)
 }
 
-func generateCNIResult(cniVersion string, cniResponse *request.CniResponse) current.Result {
-	result := current.Result{CNIVersion: cniVersion}
+func generateCNIResult(cniResponse *request.CniResponse) current.Result {
+	result := current.Result{
+		CNIVersion: current.ImplementedSpecVersion,
+		DNS:        cniResponse.DNS,
+	}
 	_, mask, _ := net.ParseCIDR(cniResponse.CIDR)
 	podIface := current.Interface{
 		Name: cniResponse.PodNicName,
@@ -131,31 +135,21 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	return client.Del(request.CniRequest{
-		CniType:      netConf.Type,
-		PodName:      podName,
-		PodNamespace: podNamespace,
-		ContainerID:  args.ContainerID,
-		NetNs:        args.Netns,
-		IfName:       args.IfName,
-		Provider:     netConf.Provider,
-		DeviceID:     netConf.DeviceID,
+		CniType:                   netConf.Type,
+		PodName:                   podName,
+		PodNamespace:              podNamespace,
+		ContainerID:               args.ContainerID,
+		NetNs:                     args.Netns,
+		IfName:                    args.IfName,
+		Provider:                  netConf.Provider,
+		DeviceID:                  netConf.DeviceID,
+		VhostUserSocketVolumeName: netConf.VhostUserSocketVolumeName,
 	})
 }
 
 type ipamConf struct {
 	ServerSocket string `json:"server_socket"`
 	Provider     string `json:"provider"`
-}
-
-type netConf struct {
-	types.NetConf
-	ServerSocket string          `json:"server_socket"`
-	Provider     string          `json:"provider"`
-	Routes       []request.Route `json:"routes"`
-	IPAM         *ipamConf       `json:"ipam"`
-	// PciAddrs in case of using sriov
-	DeviceID string `json:"deviceID"`
-	VfDriver string `json:"vf_driver"`
 }
 
 func loadNetConf(bytes []byte) (*netConf, string, error) {
@@ -198,7 +192,6 @@ func parseValueFromArgs(key, argString string) (string, error) {
 
 func assignV4Address(ipAddress, gateway string, mask *net.IPNet) (current.IPConfig, types.Route) {
 	ip := current.IPConfig{
-		Version: "4",
 		Address: net.IPNet{IP: net.ParseIP(ipAddress).To4(), Mask: mask.Mask},
 		Gateway: net.ParseIP(gateway).To4(),
 	}
@@ -213,7 +206,6 @@ func assignV4Address(ipAddress, gateway string, mask *net.IPNet) (current.IPConf
 
 func assignV6Address(ipAddress, gateway string, mask *net.IPNet) (current.IPConfig, types.Route) {
 	ip := current.IPConfig{
-		Version: "6",
 		Address: net.IPNet{IP: net.ParseIP(ipAddress).To16(), Mask: mask.Mask},
 		Gateway: net.ParseIP(gateway).To16(),
 	}

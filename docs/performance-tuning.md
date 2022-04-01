@@ -132,6 +132,16 @@ args:
 
 This can reduce about 30% of the cpu time and latency in 1byte packet test.
 
+*Note*: In underlay mode, kube-proxy can not capture underlay traffic, if disable lb, svc can not be visited.
+
+*Need Kube-OVN >= 1.9.0*.
+If you are using underlay mode network and need kube-ovn to implement the svc function, you can set the svc cidr in ovn-nb
+to bypass the conntrack system for traffic that not designate to svc.
+
+```bash
+kubectl ko nbctl set nb_global . options:svc_ipv4_cidr=10.244.0.0/16
+```
+
 ### Kernel FastPath module
 
 With Profile, the netfilter hooks inside container netns and between tunnel endpoints contribute about 25% of the CPU time
@@ -165,6 +175,54 @@ cd rpm/rpmbuild/RPMS/x86_64/
 # Copy the rpm to every node and install
 rpm -i openvswitch-kmod-2.15.2-1.el7.x86_64.rpm
 ```
+
+### Automatically compile openvswitch rpm and distribute it:
+
+```bash
+# for centos7
+$ kubectl ko tuning install-stt centos7
+# for centos8
+$ kubectl ko tuning install-stt centos8
+```
+
+​	A container will run and compile openvswitch rpm package. the rpm file will be automatically distributed to `/tmp/` of each nodes
+
+​	***Optional*** if on your system, you **can not** install the kernel-devel package that matches your system version via the package management tool(yum or apt), then you will have to download the version-compatible package yourself.
+
+If the following command fails, then you will need to download the package yourself.
+
+```bash
+$ yum install -y kernel-devel-$(uname -r)
+```
+
+​	Here are a few sites where you may find packages: [cern](https://linuxsoft.cern.ch/cern/centos/7/updates/x86_64/repoview/kernel-devel.html), [riken](http://ftp.riken.jp/Linux/cern/centos/7/updates/x86_64/repoview/kernel-devel.html). 
+
+​	You are welcome to add new download sites.
+
+​	Once downloaded, please move the download package to the **/tmp/** folder and then install it as follows:
+
+```bash
+# for centos7
+$ kubectl ko tuning local-install-stt centos7 kernel-devel-$(uname -r)
+# for centos8
+$ kubectl ko tuning local-install-stt centos8 kernel-devel-$(uname -r)
+```
+
+​	After the  distribution, the user needs to install the rpm file on each node and safely **restart the node** . 
+
+```bash
+$ rpm -i openvswitch-kmod-2.15.2-1.el7.x86_64.rpm
+# Note a safe reboot of master nodes
+$ reboot
+```
+
+​	Remove the rpm files from `/tmp/` of each node
+
+```bash
+$ kubectl ko tuning remove-stt centos
+```
+
+
 
 ### Using STT tunnel type
 

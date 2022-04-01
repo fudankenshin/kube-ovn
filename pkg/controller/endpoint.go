@@ -11,7 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
@@ -106,19 +106,20 @@ func (c *Controller) handleUpdateEndpoint(key string) error {
 		return err
 	}
 
-	svc, err := c.servicesLister.Services(namespace).Get(name)
+	orisvc, err := c.servicesLister.Services(namespace).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	svc := orisvc.DeepCopy()
 
 	clusterIPs := svc.Spec.ClusterIPs
 	if len(clusterIPs) == 0 && svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != v1.ClusterIPNone {
 		clusterIPs = []string{svc.Spec.ClusterIP}
 	}
-	if len(clusterIPs) == 0 {
+	if len(clusterIPs) == 0 || clusterIPs[0] == v1.ClusterIPNone {
 		return nil
 	}
 
@@ -168,7 +169,7 @@ func (c *Controller) handleUpdateEndpoint(key string) error {
 			svc.Annotations = make(map[string]string, 1)
 		}
 		svc.Annotations[util.VpcAnnotation] = vpcName
-		if svc, err = c.config.KubeClient.CoreV1().Services(namespace).Update(context.Background(), svc, metav1.UpdateOptions{}); err != nil {
+		if _, err = c.config.KubeClient.CoreV1().Services(namespace).Update(context.Background(), svc, metav1.UpdateOptions{}); err != nil {
 			klog.Errorf("failed to update service %s/%s: %v", namespace, svc.Name, err)
 			return err
 		}

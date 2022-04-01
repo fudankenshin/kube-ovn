@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +35,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	kubeovninformer "github.com/kubeovn/kube-ovn/pkg/client/informers/externalversions"
@@ -272,16 +275,13 @@ func (c *Controller) handleAddOrUpdateProviderNetwork(key string) error {
 
 func (c *Controller) initProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v1.Node) error {
 	if pn.Status.EnsureNodeStandardConditions(node.Name) {
-		bytes, err := pn.Status.Bytes()
+		var err error
+		pn, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().UpdateStatus(context.Background(), pn, metav1.UpdateOptions{})
 		if err != nil {
-			klog.Error(err)
+			klog.Errorf("failed to update status of provider network %s: %v", pn.Name, err)
 			return err
 		}
-		_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-		if err != nil {
-			klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-			return err
-		}
+		pn = pn.DeepCopy()
 	}
 
 	nic := pn.Spec.DefaultInterface
@@ -309,49 +309,25 @@ func (c *Controller) initProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v1
 			}
 		}
 
+		pn.Status.SetNodeNotReady(node.Name, "InitOVSBridgeFailed", err.Error())
 		if util.ContainsString(pn.Status.ReadyNodes, node.Name) {
 			pn.Status.ReadyNodes = util.RemoveString(pn.Status.ReadyNodes, node.Name)
-			if len(pn.Status.ReadyNodes) == 0 {
-				bytes := []byte(`[{ "op": "remove", "path": "/status/readyNodes"}]`)
-				_, err1 := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
-				if err1 != nil {
-					klog.Errorf("failed to patch provider network %s: %v", pn.Name, err1)
-				}
-			} else {
-				bytes, err1 := pn.Status.Bytes()
-				if err1 != nil {
-					klog.Error(err1)
-				}
-				_, err1 = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-				if err1 != nil {
-					klog.Errorf("failed to patch provider network %s: %v", pn.Name, err1)
-				}
-			}
 		}
-
-		pn.Status.SetNodeNotReady(node.Name, "InitOVSBridgeFailed", err.Error())
-		bytes, err1 := pn.Status.Bytes()
+		pn, err1 := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().UpdateStatus(context.Background(), pn, metav1.UpdateOptions{})
 		if err1 != nil {
-			klog.Error(err1)
-		} else {
-			_, err1 = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-			if err1 != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err1)
-			}
+			klog.Errorf("failed to update status of provider network %s: %v", pn.Name, err1)
 		}
 
 		return err
 	}
 
 	pn.Status.SetNodeReady(node.Name, "InitOVSBridgeSucceeded", "")
-	bytes, err := pn.Status.Bytes()
-	if err != nil {
-		klog.Error(err)
-		return err
+	if !util.ContainsString(pn.Status.ReadyNodes, node.Name) {
+		pn.Status.ReadyNodes = append(pn.Status.ReadyNodes, node.Name)
 	}
-	_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+	_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().UpdateStatus(context.Background(), pn, metav1.UpdateOptions{})
 	if err != nil {
-		klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+		klog.Errorf("failed to update status of provider network %s: %v", pn.Name, err)
 		return err
 	}
 
@@ -374,67 +350,27 @@ func (c *Controller) initProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v1
 		return err
 	}
 
-	if !util.ContainsString(pn.Status.ReadyNodes, node.Name) {
-		pn.Status.ReadyNodes = append(pn.Status.ReadyNodes, node.Name)
-		bytes, err := pn.Status.Bytes()
-		if err != nil {
-			klog.Error(err)
-			return err
-		}
-
-		_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-		if err != nil {
-			klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-			return err
-		}
-	}
-
 	return nil
 }
 
 func (c *Controller) updateProviderNetworkStatusForNodeDeletion(pn *kubeovnv1.ProviderNetwork, node string) error {
+	var needUpdate bool
 	if util.ContainsString(pn.Status.ReadyNodes, node) {
 		pn.Status.ReadyNodes = util.RemoveString(pn.Status.ReadyNodes, node)
-		if len(pn.Status.ReadyNodes) == 0 {
-			bytes := []byte(`[{ "op": "remove", "path": "/status/readyNodes"}]`)
-			_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
-			if err != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-				return err
-			}
-		} else {
-			bytes, err := pn.Status.Bytes()
-			if err != nil {
-				klog.Error(err)
-				return err
-			}
-			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-			if err != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-				return err
-			}
-		}
+		needUpdate = true
 	}
 	if pn.Status.RemoveNodeConditions(node) {
-		if len(pn.Status.Conditions) == 0 {
-			bytes := []byte(`[{ "op": "remove", "path": "/status/conditions"}]`)
-			_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
-			if err != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-				return err
-			}
-		} else {
-			bytes, err := pn.Status.Bytes()
-			if err != nil {
-				klog.Error(err)
-				return err
-			}
-			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-			if err != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-				return err
-			}
-		}
+		needUpdate = true
+	}
+
+	if !needUpdate {
+		return nil
+	}
+
+	_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().UpdateStatus(context.Background(), pn, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("failed to update status of provider network %s: %v", pn.Name, err)
+		return err
 	}
 
 	return nil
@@ -449,24 +385,10 @@ func (c *Controller) cleanProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v
 
 	var err error
 	if pn.Status.RemoveNodeConditions(node.Name) {
-		if len(pn.Status.Conditions) == 0 {
-			bytes := []byte(`[{ "op": "remove", "path": "/status/conditions"}]`)
-			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
-			if err != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-				return err
-			}
-		} else {
-			bytes, err := pn.Status.Bytes()
-			if err != nil {
-				klog.Error(err)
-				return err
-			}
-			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-			if err != nil {
-				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
-				return err
-			}
+		pn, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().UpdateStatus(context.Background(), pn, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorf("failed to update status of provider network %s: %v", pn.Name, err)
+			return err
 		}
 	}
 
@@ -482,7 +404,7 @@ func (c *Controller) cleanProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v
 		return err
 	}
 
-	if err = c.updateProviderNetworkStatusForNodeDeletion(pn, node.Name); err != nil {
+	if err = c.updateProviderNetworkStatusForNodeDeletion(pn.DeepCopy(), node.Name); err != nil {
 		return err
 	}
 	if err = ovsCleanProviderNetwork(pn.Name); err != nil {
@@ -882,7 +804,7 @@ func (c *Controller) getPolicyRouting(subnet *kubeovnv1.Subnet) ([]netlink.Rule,
 	for i := range protocols {
 		family, _ := util.ProtocolToFamily(protocols[i])
 		routes = append(routes, netlink.Route{
-			Protocol: family,
+			Protocol: netlink.RouteProtocol(family),
 			Table:    int(subnet.Spec.PolicyRoutingTableID),
 			Gw:       net.ParseIP(egw[i]),
 		})
@@ -995,9 +917,14 @@ func (c *Controller) handlePod(key string) error {
 		return err
 	}
 
+	podName := pod.Name
+	if pod.Annotations[fmt.Sprintf(util.VmTemplate, util.OvnProvider)] != "" {
+		podName = pod.Annotations[fmt.Sprintf(util.VmTemplate, util.OvnProvider)]
+	}
+
 	// set default nic bandwidth
-	ifaceID := ovs.PodNameToPortName(pod.Name, pod.Namespace, util.OvnProvider)
-	err = ovs.SetInterfaceBandwidth(pod.Name, pod.Namespace, ifaceID, pod.Annotations[util.EgressRateAnnotation], pod.Annotations[util.IngressRateAnnotation], pod.Annotations[util.PriorityAnnotation])
+	ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
+	err = ovs.SetInterfaceBandwidth(podName, pod.Namespace, ifaceID, pod.Annotations[util.EgressRateAnnotation], pod.Annotations[util.IngressRateAnnotation], pod.Annotations[util.PriorityAnnotation])
 	if err != nil {
 		return err
 	}
@@ -1006,7 +933,7 @@ func (c *Controller) handlePod(key string) error {
 		return err
 	}
 	// set linux-netem qos
-	err = ovs.SetNetemQos(pod.Name, pod.Namespace, ifaceID, pod.Annotations[util.NetemQosLatencyAnnotation], pod.Annotations[util.NetemQosLimitAnnotation], pod.Annotations[util.NetemQosLossAnnotation])
+	err = ovs.SetNetemQos(podName, pod.Namespace, ifaceID, pod.Annotations[util.NetemQosLatencyAnnotation], pod.Annotations[util.NetemQosLimitAnnotation], pod.Annotations[util.NetemQosLossAnnotation])
 	if err != nil {
 		return err
 	}
@@ -1018,9 +945,12 @@ func (c *Controller) handlePod(key string) error {
 	}
 	for _, multiNet := range attachNets {
 		provider := fmt.Sprintf("%s.%s.ovn", multiNet.Name, multiNet.Namespace)
+		if pod.Annotations[fmt.Sprintf(util.VmTemplate, provider)] != "" {
+			podName = pod.Annotations[fmt.Sprintf(util.VmTemplate, provider)]
+		}
 		if pod.Annotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)] == "true" {
-			ifaceID = ovs.PodNameToPortName(pod.Name, pod.Namespace, provider)
-			err = ovs.SetInterfaceBandwidth(pod.Name, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.EgressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.IngressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.PriorityAnnotationTemplate, provider)])
+			ifaceID = ovs.PodNameToPortName(podName, pod.Namespace, provider)
+			err = ovs.SetInterfaceBandwidth(podName, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.EgressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.IngressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.PriorityAnnotationTemplate, provider)])
 			if err != nil {
 				return err
 			}
@@ -1028,7 +958,7 @@ func (c *Controller) handlePod(key string) error {
 			if err != nil {
 				return err
 			}
-			err = ovs.SetNetemQos(pod.Name, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.NetemQosLatencyAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLimitAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLossAnnotationTemplate, provider)])
+			err = ovs.SetNetemQos(podName, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.NetemQosLatencyAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLimitAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLossAnnotationTemplate, provider)])
 			if err != nil {
 				return err
 			}
@@ -1157,15 +1087,19 @@ func (c *Controller) setSubnetQosPriority(subnet *kubeovnv1.Subnet) error {
 			pod.Status.PodIP == "" {
 			continue
 		}
+		podName := pod.Name
+		if pod.Annotations[fmt.Sprintf(util.VmTemplate, util.OvnProvider)] != "" {
+			podName = pod.Annotations[fmt.Sprintf(util.VmTemplate, util.OvnProvider)]
+		}
 
 		// set priority for eth0 interface in pod
 		if pod.Annotations[util.LogicalSwitchAnnotation] == subnet.Name {
-			ifaceID := ovs.PodNameToPortName(pod.Name, pod.Namespace, util.OvnProvider)
+			ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
 			priority := htbQos.Spec.Priority
 			if pod.Annotations[util.PriorityAnnotation] != "" {
 				priority = pod.Annotations[util.PriorityAnnotation]
 			}
-			if err = ovs.SetPodQosPriority(pod.Name, pod.Namespace, ifaceID, priority, qosIfaceUidMap, queueIfaceUidMap); err != nil {
+			if err = ovs.SetPodQosPriority(podName, pod.Namespace, ifaceID, priority, qosIfaceUidMap, queueIfaceUidMap); err != nil {
 				klog.Errorf("failed to set htbqos priority for pod %s/%s, iface %v: %v", pod.Namespace, pod.Name, ifaceID, err)
 				return err
 			}
@@ -1181,15 +1115,18 @@ func (c *Controller) setSubnetQosPriority(subnet *kubeovnv1.Subnet) error {
 			if subnet.Spec.Provider != provider {
 				continue
 			}
+			if pod.Annotations[fmt.Sprintf(util.VmTemplate, provider)] != "" {
+				podName = pod.Annotations[fmt.Sprintf(util.VmTemplate, provider)]
+			}
 
 			if pod.Annotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)] == "true" {
-				ifaceID := ovs.PodNameToPortName(pod.Name, pod.Namespace, provider)
+				ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, provider)
 				priority := htbQos.Spec.Priority
 				if pod.Annotations[fmt.Sprintf(util.PriorityAnnotationTemplate, provider)] != "" {
 					priority = pod.Annotations[fmt.Sprintf(util.PriorityAnnotationTemplate, provider)]
 				}
 
-				if err = ovs.SetPodQosPriority(pod.Name, pod.Namespace, ifaceID, priority, qosIfaceUidMap, queueIfaceUidMap); err != nil {
+				if err = ovs.SetPodQosPriority(podName, pod.Namespace, ifaceID, priority, qosIfaceUidMap, queueIfaceUidMap); err != nil {
 					klog.Errorf("failed to set htbqos priority for pod %s/%s, iface %v: %v", pod.Namespace, pod.Name, ifaceID, err)
 					return err
 				}
@@ -1233,6 +1170,7 @@ func (c *Controller) deleteSubnetQos(subnet *kubeovnv1.Subnet) error {
 			pod.DeletionTimestamp != nil {
 			continue
 		}
+		podName := pod.Name
 
 		if pod.Annotations[util.LogicalSwitchAnnotation] == subnet.Name {
 			// if pod's annotation for ingress-rate or priority exists, should keep qos for pod
@@ -1240,8 +1178,11 @@ func (c *Controller) deleteSubnetQos(subnet *kubeovnv1.Subnet) error {
 				pod.Annotations[util.PriorityAnnotation] != "" {
 				continue
 			}
-			ifaceID := ovs.PodNameToPortName(pod.Name, pod.Namespace, util.OvnProvider)
-			if err := c.clearQos(pod.Name, pod.Namespace, ifaceID); err != nil {
+			if pod.Annotations[fmt.Sprintf(util.VmTemplate, util.OvnProvider)] != "" {
+				podName = pod.Annotations[fmt.Sprintf(util.VmTemplate, util.OvnProvider)]
+			}
+			ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
+			if err := c.clearQos(podName, pod.Namespace, ifaceID); err != nil {
 				return err
 			}
 		}
@@ -1258,16 +1199,45 @@ func (c *Controller) deleteSubnetQos(subnet *kubeovnv1.Subnet) error {
 				pod.Annotations[fmt.Sprintf(util.PriorityAnnotationTemplate, provider)] != "" {
 				continue
 			}
+			if pod.Annotations[fmt.Sprintf(util.VmTemplate, provider)] != "" {
+				podName = pod.Annotations[fmt.Sprintf(util.VmTemplate, provider)]
+			}
 
 			if pod.Annotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)] == "true" {
-				ifaceID := ovs.PodNameToPortName(pod.Name, pod.Namespace, provider)
-				if err := c.clearQos(pod.Name, pod.Namespace, ifaceID); err != nil {
+				ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, provider)
+				if err := c.clearQos(podName, pod.Namespace, ifaceID); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	return nil
+}
+
+func (c *Controller) operateMod() {
+	modules, ok := os.LookupEnv(util.KoENV)
+	if !ok || modules == "" {
+		err := removeAllMods(util.KoDir)
+		if err != nil {
+			klog.Errorf("remove all module in %s failed", util.KoDir)
+		}
+		return
+	}
+	for _, module := range strings.Split(modules, ",") {
+		isFileExist, _ := isFile(module, util.KoDir)
+		if !isFileExist && isMod(module) {
+			err := removeKo(module)
+			if err != nil {
+				klog.Errorf("remove module %s failed %v", module, err)
+			}
+		} else if !isMod(module) && isFileExist {
+			err := insertKo(module)
+			if err != nil {
+				klog.Errorf("insert module %s failed: %v", module, err)
+			}
+			klog.Infof("insert module %s", module)
+		}
+	}
 }
 
 // Run starts controller
@@ -1280,6 +1250,8 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	go wait.Until(ovs.CleanLostInterface, time.Minute, stopCh)
 	go wait.Until(recompute, 10*time.Minute, stopCh)
+	go wait.Until(rotateLog, 1*time.Hour, stopCh)
+	go wait.Until(c.operateMod, 10*time.Second, stopCh)
 
 	if ok := cache.WaitForCacheSync(stopCh, c.providerNetworksSynced, c.subnetsSynced, c.podsSynced, c.nodesSynced, c.htbQosSynced); !ok {
 		klog.Fatalf("failed to wait for caches to sync")
@@ -1314,4 +1286,108 @@ func recompute() {
 	if err != nil {
 		klog.Errorf("failed to recompute ovn-controller %q", output)
 	}
+}
+
+func rotateLog() {
+	output, err := exec.Command("logrotate", "/etc/logrotate.d/openvswitch").CombinedOutput()
+	if err != nil {
+		klog.Errorf("failed to rotate openvswitch log %q", output)
+	}
+	output, err = exec.Command("logrotate", "/etc/logrotate.d/ovn").CombinedOutput()
+	if err != nil {
+		klog.Errorf("failed to rotate ovn log %q", output)
+	}
+	output, err = exec.Command("logrotate", "/etc/logrotate.d/kubeovn").CombinedOutput()
+	if err != nil {
+		klog.Errorf("failed to rotate kube-ovn log %q", output)
+	}
+}
+
+func isMod(modName string) bool {
+	out, err := exec.Command("lsmod").CombinedOutput()
+	if err != nil {
+		klog.Errorf("list module %s failed: %v", modName, err)
+	}
+	names := strings.Split(modName, ".")
+	return strings.Contains(string(out), names[0])
+}
+
+func insertKo(koName string) error {
+	file := util.KoDir + koName
+	out, err := exec.Command("insmod", file).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("insert module %s failed: %v", koName, err)
+	}
+	if string(out) != "" {
+		return fmt.Errorf("insert module %s failed: %v", koName, string(out))
+	}
+	return nil
+}
+
+func removeAllMods(dir string) error {
+	kos, err := readKos(dir)
+	if err != nil {
+		return fmt.Errorf("access kos in %s failed: %v", dir, err)
+	}
+	for _, ko := range *kos {
+		err := removeKo(ko)
+		if err != nil {
+			return fmt.Errorf("remove module %s failed: %v", ko, err)
+		}
+	}
+	return nil
+}
+
+func removeKo(koName string) error {
+	out, err := exec.Command("rmmod", koName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("remove module %s failed: %v", koName, err)
+	}
+	if string(out) != "" {
+		return fmt.Errorf("remove module %s faied: %v", koName, string(out))
+	}
+	return nil
+}
+
+func readKos(dir string) (*[]string, error) {
+	kos := new([]string)
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			klog.Errorf("failed to access path %q: %v", path, err)
+		}
+		if d.IsDir() {
+			return nil
+		}
+		isMatch, _ := regexp.MatchString(".[.]ko$", d.Name())
+		if isMatch {
+			*kos = append(*kos, d.Name())
+		}
+		return nil
+	})
+	if err != nil {
+		return kos, fmt.Errorf("error when walking the path %q: %v", dir, err)
+	}
+	return kos, nil
+}
+
+func isFile(filename string, dir string) (bool, string) {
+	isFile := false
+	fileFullName := ""
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			klog.Errorf("failed to access path %q: %v", path, err)
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.Contains(d.Name(), filename) {
+			isFile = true
+			fileFullName = filename
+		}
+		return nil
+	})
+	if err != nil {
+		klog.Errorf("error when walking the path %q: %v", dir, err)
+	}
+	return isFile, fileFullName
 }

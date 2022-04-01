@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -21,6 +21,32 @@ type vpcService struct {
 	Protocol v1.Protocol
 }
 
+func (c *Controller) enqueueAddService(obj interface{}) {
+	if !c.isLeader() {
+		return
+	}
+	var key string
+	var err error
+	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	svc := obj.(*v1.Service)
+	klog.V(3).Infof("enqueue add service %s", key)
+
+	if c.config.EnableNP {
+		var netpols []string
+		if netpols, err = c.svcMatchNetworkPolicies(svc); err != nil {
+			utilruntime.HandleError(err)
+			return
+		}
+
+		for _, np := range netpols {
+			c.updateNpQueue.Add(np)
+		}
+	}
+}
+
 func (c *Controller) enqueueDeleteService(obj interface{}) {
 	if !c.isLeader() {
 		return
@@ -29,6 +55,19 @@ func (c *Controller) enqueueDeleteService(obj interface{}) {
 	//klog.V(3).Infof("enqueue delete service %s/%s", svc.Namespace, svc.Name)
 	klog.Infof("enqueue delete service %s/%s", svc.Namespace, svc.Name)
 	if svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "" {
+
+		if c.config.EnableNP {
+			var netpols []string
+			var err error
+			if netpols, err = c.svcMatchNetworkPolicies(svc); err != nil {
+				utilruntime.HandleError(err)
+				return
+			}
+
+			for _, np := range netpols {
+				c.updateNpQueue.Add(np)
+			}
+		}
 		for _, port := range svc.Spec.Ports {
 			vpcSvc := &vpcService{
 				Vip:      fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, port.Port),

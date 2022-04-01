@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
@@ -112,7 +112,8 @@ func (c *Controller) removeInterConnection(azName string) error {
 		klog.Errorf("failed to list nodes, %v", err)
 		return err
 	}
-	for _, no := range nodes {
+	for _, orino := range nodes {
+		no := orino.DeepCopy()
 		patchPayloadTemplate :=
 			`[{
         "op": "%s",
@@ -174,11 +175,12 @@ func (c *Controller) establishInterConnection(config map[string]string) error {
 	gwNodes := strings.Split(config["gw-nodes"], ",")
 	for _, gw := range gwNodes {
 		gw = strings.TrimSpace(gw)
-		node, err := c.nodesLister.Get(gw)
+		orinode, err := c.nodesLister.Get(gw)
 		if err != nil {
 			klog.Errorf("failed to get gw node %s, %v", gw, err)
 			return err
 		}
+		node := orinode.DeepCopy()
 		patchPayloadTemplate :=
 			`[{
         "op": "%s",
@@ -209,7 +211,7 @@ func (c *Controller) establishInterConnection(config map[string]string) error {
 	}
 	if len(chassises) == 0 {
 		klog.Error("no available ic gw")
-		return fmt.Errorf("noavailable ic gw")
+		return fmt.Errorf("no available ic gw")
 	}
 	if err := c.waitTsReady(); err != nil {
 		klog.Errorf("failed to wait ts ready, %v", err)

@@ -2,13 +2,13 @@ package ovnmonitor
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync/atomic"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // IncrementErrorCounter increases the counter of failed queries to OVN server.
@@ -42,7 +42,7 @@ func (e *Exporter) getOvnStatus() map[string]int {
 	result["ovsdb-server-southbound"] = parseDbStatus(string(output))
 
 	// get ovn-northd status
-	pid, err := ioutil.ReadFile("/var/run/ovn/ovn-northd.pid")
+	pid, err := os.ReadFile("/var/run/ovn/ovn-northd.pid")
 	if err != nil {
 		klog.Errorf("read ovn-northd pid failed, err %v", err)
 		result["ovn-northd"] = 0
@@ -248,4 +248,67 @@ func parseDbStatus(output string) int {
 		result = 0
 	}
 	return result
+}
+
+func getDBStatus(dbName string) (bool, error) {
+	var cmdstr string
+	var result bool
+	switch dbName {
+	case "OVN_Northbound":
+		cmdstr = fmt.Sprintf("ovn-appctl -t /var/run/ovn/ovnnb_db.ctl ovsdb-server/get-db-storage-status %s", dbName)
+	case "OVN_Southbound":
+		cmdstr = fmt.Sprintf("ovn-appctl -t /var/run/ovn/ovnsb_db.ctl ovsdb-server/get-db-storage-status %s", dbName)
+	}
+
+	cmd := exec.Command("sh", "-c", cmdstr)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		klog.Errorf("get ovn-northbound status failed, err %v", err)
+		return false, err
+	}
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "status: ok") {
+			result = true
+			break
+		}
+		if strings.Contains(line, "ovsdb error") {
+			result = false
+			break
+		}
+	}
+
+	return result, nil
+}
+
+func resetLogicalSwitchMetrics() {
+	metricLogicalSwitchInfo.Reset()
+	metricLogicalSwitchPortsNum.Reset()
+	metricLogicalSwitchPortBinding.Reset()
+	metricLogicalSwitchExternalIDs.Reset()
+	metricLogicalSwitchTunnelKey.Reset()
+}
+
+func resetLogicalSwitchPortMetrics() {
+	metricLogicalSwitchPortInfo.Reset()
+	metricLogicalSwitchPortTunnelKey.Reset()
+}
+
+func resetOvnClusterMetrics() {
+	metricClusterRole.Reset()
+	metricClusterStatus.Reset()
+	metricClusterTerm.Reset()
+	metricClusterLeaderSelf.Reset()
+	metricClusterVoteSelf.Reset()
+
+	metricClusterElectionTimer.Reset()
+	metricClusterNotCommittedEntryCount.Reset()
+	metricClusterNotAppliedEntryCount.Reset()
+	metricClusterLogIndexStart.Reset()
+	metricClusterLogIndexNext.Reset()
+
+	metricClusterInConnTotal.Reset()
+	metricClusterOutConnTotal.Reset()
+	metricClusterInConnErrTotal.Reset()
+	metricClusterOutConnErrTotal.Reset()
 }
